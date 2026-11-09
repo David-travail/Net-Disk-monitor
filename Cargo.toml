@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = [
+    "common",
+    "engine",
+    "ui",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Ton Nom <ton.email@example.com>"]
+
+[workspace.dependencies]
+# Dépendances partagées pour éviter les duplications de versions
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.0", features = ["full"] }

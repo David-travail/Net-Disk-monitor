@@ -1,0 +1,18 @@
+# Normaliser les fichiers texte en LF
+* text=auto eol=lf
+
+# Rust
+*.rs text eol=lf
+Cargo.toml text eol=lf
+Cargo.lock text eol=lf
+
+# Documentation
+*.md text eol=lf
+
+# Scripts Linux
+*.sh text eol=lf
+
+# Scripts Windows
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf

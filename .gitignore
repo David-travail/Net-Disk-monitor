@@ -1,0 +1,46 @@
+# =========================
+# Rust
+# =========================
+
+# Fichiers générés par Cargo
+/target/
+**/target/
+
+# Sauvegardes générées par rustfmt
+**/*.rs.bk
+
+# =========================
+# Secrets / environnement
+# =========================
+
+.env
+.env.*
+!.env.example
+
+# =========================
+# VS Code
+# =========================
+
+.vscode/
+*.code-workspace
+
+# =========================
+# Windows
+# =========================
+
+Thumbs.db
+Desktop.ini
+
+# =========================
+# macOS
+# =========================
+
+.DS_Store
+
+# =========================
+# Logs / temporaires
+# =========================
+
+*.log
+*.tmp
+*.bak

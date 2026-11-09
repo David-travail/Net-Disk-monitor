@@ -1,0 +1,12 @@
+# Intervalle de vérification des disques, en secondes.
+intervalle_scrutation_disque_secondes = 60
+
+# Intervalle de lecture de la table ARP, en secondes.
+intervalle_scrutation_reseau_secondes = 30
+
+# Pourcentage d'occupation qui declenche une alerte disque.
+seuil_alerte_disque_pourcentage = 85.0
+
+# Identifiants Telegram optionnels ; laissez-les vides jusqu'a la configuration du bot.
+jeton_bot_telegram = ""
+identifiant_chat_telegram = ""

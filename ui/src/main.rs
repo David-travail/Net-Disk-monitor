@@ -14,7 +14,8 @@
 //! - `formats_disk_sizes_in_human_readable_units` : teste le formatage des tailles.
 
 use common::{
-    DeviceDetails, DiskDetails, LargeFileDetails, MessageClientToEngine, MessageEngineToClient,
+    Config, DeviceDetails, DiskDetails, LargeFileDetails, MessageClientToEngine,
+    MessageEngineToClient,
 };
 use eframe::egui;
 use std::{
@@ -27,9 +28,6 @@ use tokio::{
     net::TcpStream,
     sync::mpsc::{self as tokio_mpsc, UnboundedSender},
 };
-
-const ENGINE_ADDR: &str = "127.0.0.1:7878";
-const REFRESH_INTERVAL: Duration = Duration::from_secs(3);
 
 #[derive(Default)]
 struct MonitorData {
@@ -50,6 +48,11 @@ struct NetDiskMonitorApp {
     updates: Receiver<Result<MessageEngineToClient, String>>,
     requests: UnboundedSender<MessageClientToEngine>,
     data: MonitorData,
+    configuration_error: Option<String>,
+    engine_address: String,
+    minimum_file_size_mio: u64,
+    maximum_files: usize,
+    refresh_interval: Duration,
 }
 
 impl NetDiskMonitorApp {
@@ -60,11 +63,18 @@ impl NetDiskMonitorApp {
     fn new(
         updates: Receiver<Result<MessageEngineToClient, String>>,
         requests: UnboundedSender<MessageClientToEngine>,
+        config: Config,
+        configuration_error: Option<String>,
     ) -> Self {
         Self {
             updates,
             requests,
             data: MonitorData::default(),
+            configuration_error,
+            engine_address: config.adresse_moteur,
+            minimum_file_size_mio: config.taille_min_fichier_volumineux_mio,
+            maximum_files: config.nombre_max_fichiers_volumineux,
+            refresh_interval: Duration::from_secs(config.intervalle_actualisation_ihm_secondes),
         }
     }
 
@@ -165,13 +175,17 @@ impl eframe::App for NetDiskMonitorApp {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(format!(
                         "Actualisation toutes les {} secondes",
-                        REFRESH_INTERVAL.as_secs()
+                        self.refresh_interval.as_secs()
                     ));
                 });
             });
         });
 
         egui::CentralPanel::default().show(context, |ui| {
+            if let Some(error) = &self.configuration_error {
+                ui.colored_label(egui::Color32::LIGHT_RED, format!("Configuration : {error}"));
+                ui.add_space(8.0);
+            }
             if let Some(error) = &self.data.last_error {
                 ui.colored_label(egui::Color32::LIGHT_RED, format!("Erreur : {error}"));
                 ui.add_space(8.0);
@@ -240,7 +254,10 @@ impl eframe::App for NetDiskMonitorApp {
                     }
                 }
             });
-            ui.label("Fichiers d'au moins 100 Mio ; les 100 plus volumineux sont affichés.");
+            ui.label(format!(
+                "Fichiers d'au moins {} Mio ; les {} plus volumineux sont affichés.",
+                self.minimum_file_size_mio, self.maximum_files
+            ));
             if self.data.is_working {
                 ui.label("Opération en cours…");
             }
@@ -253,6 +270,7 @@ impl eframe::App for NetDiskMonitorApp {
                 }
             } else {
                 let files = self.data.large_files.clone();
+                let path_column_width = (ui.available_width() - 140.0).clamp(120.0, 500.0);
                 egui::ScrollArea::vertical()
                     .max_height(220.0)
                     .show(ui, |ui| {
@@ -261,8 +279,11 @@ impl eframe::App for NetDiskMonitorApp {
                             .num_columns(3)
                             .show(ui, |ui| {
                                 ui.strong("Sélection");
-                                ui.strong("Fichier");
-                                ui.strong("Taille");
+                                ui.add_sized(
+                                    [path_column_width, ui.spacing().interact_size.y],
+                                    egui::Label::new("Fichier"),
+                                );
+                                ui.strong("Poids");
                                 ui.end_row();
 
                                 for file in files {
@@ -275,8 +296,12 @@ impl eframe::App for NetDiskMonitorApp {
                                             self.data.selected_paths.remove(&file.path);
                                         }
                                     }
-                                    ui.label(&file.path);
-                                    ui.label(format_bytes(file.size_bytes));
+                                    ui.add_sized(
+                                        [path_column_width, ui.spacing().interact_size.y],
+                                        egui::Label::new(file_display_name(&file.path)).truncate(),
+                                    )
+                                    .on_hover_text(&file.path);
+                                    ui.monospace(format_bytes(file.size_bytes));
                                     ui.end_row();
                                 }
                             });
@@ -361,7 +386,7 @@ impl eframe::App for NetDiskMonitorApp {
 
         egui::TopBottomPanel::bottom("footer").show(context, |ui| {
             ui.horizontal(|ui| {
-                ui.label(format!("Moteur : {ENGINE_ADDR}"));
+                ui.label(format!("Moteur : {}", self.engine_address));
                 ui.separator();
                 ui.label("État actualisé automatiquement");
             });
@@ -375,13 +400,25 @@ impl eframe::App for NetDiskMonitorApp {
 /// Sortie : résultat eframe, avec une erreur si la fenêtre ne peut pas être créée.
 fn main() -> Result<(), eframe::Error> {
     let (updates_tx, updates_rx) = mpsc::channel();
+    let (config, configuration_error) = match load_ui_config() {
+        Ok(config) => (config, None),
+        Err(error) => (Config::default(), Some(error)),
+    };
     let (requests_tx, requests_rx) = tokio_mpsc::unbounded_channel();
-    start_status_polling(updates_tx, requests_rx);
+    start_status_polling(
+        updates_tx,
+        requests_rx,
+        config.adresse_moteur.clone(),
+        Duration::from_secs(config.intervalle_actualisation_ihm_secondes),
+    );
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([900.0, 760.0])
-            .with_min_inner_size([680.0, 520.0]),
+            .with_inner_size([config.largeur_fenetre_ihm, config.hauteur_fenetre_ihm])
+            .with_min_inner_size([
+                config.largeur_min_fenetre_ihm,
+                config.hauteur_min_fenetre_ihm,
+            ]),
         ..Default::default()
     };
 
@@ -389,7 +426,12 @@ fn main() -> Result<(), eframe::Error> {
         "NetDiskMonitor",
         options,
         Box::new(move |_creation_context| {
-            Ok(Box::new(NetDiskMonitorApp::new(updates_rx, requests_tx)))
+            Ok(Box::new(NetDiskMonitorApp::new(
+                updates_rx,
+                requests_tx,
+                config,
+                configuration_error,
+            )))
         }),
     )
 }
@@ -401,6 +443,8 @@ fn main() -> Result<(), eframe::Error> {
 fn start_status_polling(
     updates: mpsc::Sender<Result<MessageEngineToClient, String>>,
     mut requests: tokio_mpsc::UnboundedReceiver<MessageClientToEngine>,
+    engine_address: String,
+    refresh_interval: Duration,
 ) {
     std::thread::spawn(move || {
         let runtime = match tokio::runtime::Builder::new_current_thread()
@@ -417,7 +461,7 @@ fn start_status_polling(
         };
 
         runtime.block_on(async move {
-            let mut ticker = tokio::time::interval(REFRESH_INTERVAL);
+            let mut ticker = tokio::time::interval(refresh_interval);
             loop {
                 let request = tokio::select! {
                     _ = ticker.tick() => MessageClientToEngine::GetStatus,
@@ -426,7 +470,7 @@ fn start_status_polling(
                         None => break,
                     },
                 };
-                let result = request_engine(request).await;
+                let result = request_engine(request, &engine_address).await;
                 if updates.send(result).is_err() {
                     break;
                 }
@@ -439,8 +483,11 @@ fn start_status_polling(
 ///
 /// Entrées : `request`, commande à transmettre au moteur.
 /// Sortie : réponse du moteur, ou description textuelle de l'erreur réseau/JSON.
-async fn request_engine(request: MessageClientToEngine) -> Result<MessageEngineToClient, String> {
-    let stream = TcpStream::connect(ENGINE_ADDR)
+async fn request_engine(
+    request: MessageClientToEngine,
+    engine_address: &str,
+) -> Result<MessageEngineToClient, String> {
+    let stream = TcpStream::connect(engine_address)
         .await
         .map_err(|error| error.to_string())?;
     let (read_half, mut write_half) = stream.into_split();
@@ -466,6 +513,21 @@ async fn request_engine(request: MessageClientToEngine) -> Result<MessageEngineT
         .map_err(|error| format!("Réponse du moteur invalide : {error}"))
 }
 
+fn load_ui_config() -> Result<Config, String> {
+    let contents = std::fs::read_to_string("config.toml")
+        .map_err(|error| format!("Impossible de lire config.toml : {error}"))?;
+    parse_ui_config(&contents)
+}
+
+fn parse_ui_config(contents: &str) -> Result<Config, String> {
+    let config: Config = toml::from_str(contents)
+        .map_err(|error| format!("Fichier config.toml invalide : {error}"))?;
+    config
+        .validate()
+        .map_err(|error| format!("Configuration invalide : {error}"))?;
+    Ok(config)
+}
+
 /// Formate une taille en octets en utilisant l'unité binaire appropriée.
 ///
 /// Entrées : `bytes`, taille à convertir.
@@ -485,9 +547,16 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
+fn file_display_name(path: &str) -> &str {
+    std::path::Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(path)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::format_bytes;
+    use super::{file_display_name, format_bytes, parse_ui_config};
 
     #[test]
     /// Vérifie le formatage des octets et des unités supérieures.
@@ -498,5 +567,24 @@ mod tests {
         assert_eq!(format_bytes(512), "512 octets");
         assert_eq!(format_bytes(1024), "1.0 Ko");
         assert_eq!(format_bytes(1024 * 1024), "1.0 Mo");
+    }
+
+    #[test]
+    fn displays_file_name_without_hiding_its_full_path() {
+        assert_eq!(
+            file_display_name(r"C:\Users\test\large-file.iso"),
+            "large-file.iso"
+        );
+    }
+
+    #[test]
+    fn reads_all_ui_settings_from_the_shared_config_file() {
+        let config =
+            parse_ui_config(include_str!("../../config.toml")).expect("parse shared config");
+
+        assert_eq!(config.adresse_moteur, "127.0.0.1:7878");
+        assert_eq!(config.intervalle_actualisation_ihm_secondes, 3);
+        assert_eq!(config.taille_min_fichier_volumineux_mio, 100);
+        assert_eq!(config.nombre_max_fichiers_volumineux, 100);
     }
 }

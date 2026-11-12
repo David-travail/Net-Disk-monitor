@@ -28,12 +28,7 @@ use tokio::{
     time::sleep,
 };
 
-const LISTEN_ADDR: &str = "127.0.0.1:7878";
 const CONFIG_PATH: &str = "config.toml";
-const DEFAULT_CONFIG_FILE: &str =
-    "intervalle_scrutation_disque_secondes = 60\nintervalle_scrutation_reseau_secondes = 30\nseuil_alerte_disque_pourcentage = 85.0\njeton_bot_telegram = \"\"\nidentifiant_chat_telegram = \"\"\n";
-const LARGE_FILE_MIN_BYTES: u64 = 100 * 1024 * 1024;
-const MAX_LARGE_FILES: usize = 100;
 
 #[derive(Default)]
 struct Snapshot {
@@ -55,20 +50,19 @@ struct EngineState {
 /// Sortie : `Ok(())` en cas d'arrêt normal, ou une erreur si le serveur ne peut pas démarrer.
 async fn main() -> Result<(), Box<dyn Error>> {
     let config = load_config()?;
+    let listen_address = config.adresse_ecoute_moteur.clone();
     let (config_tx, _) = watch::channel(config);
     let state = std::sync::Arc::new(EngineState {
         snapshot: RwLock::new(Snapshot::default()),
         config: config_tx,
-        http_client: reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .build()?,
+        http_client: reqwest::Client::builder().build()?,
     });
 
     tokio::spawn(monitor_disks(state.clone()));
     tokio::spawn(monitor_network(state.clone()));
 
-    let listener = TcpListener::bind(LISTEN_ADDR).await?;
-    println!("Moteur NetDiskMonitor en écoute sur {LISTEN_ADDR}");
+    let listener = TcpListener::bind(&listen_address).await?;
+    println!("Moteur NetDiskMonitor en écoute sur {listen_address}");
 
     loop {
         match listener.accept().await {
@@ -93,8 +87,10 @@ fn load_config() -> Result<Config, Box<dyn Error>> {
     let contents = match std::fs::read_to_string(CONFIG_PATH) {
         Ok(contents) => contents,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::write(CONFIG_PATH, DEFAULT_CONFIG_FILE)?;
-            DEFAULT_CONFIG_FILE.to_owned()
+            let defaults = Config::default();
+            let contents = toml::to_string_pretty(&defaults)?;
+            std::fs::write(CONFIG_PATH, &contents)?;
+            contents
         }
         Err(error) => return Err(error.into()),
     };
@@ -109,17 +105,7 @@ fn load_config() -> Result<Config, Box<dyn Error>> {
 /// Entrées : `config`, configuration à examiner.
 /// Sortie : `Ok(())` si elle est valide, sinon une erreur indiquant le réglage invalide.
 fn validate_config(config: &Config) -> Result<(), Box<dyn Error>> {
-    if config.intervalle_scrutation_disque_secondes == 0
-        || config.intervalle_scrutation_reseau_secondes == 0
-    {
-        return Err("Les intervalles de scrutation doivent être supérieurs à zéro.".into());
-    }
-    if !config.seuil_alerte_disque_pourcentage.is_finite()
-        || !(0.0..=100.0).contains(&config.seuil_alerte_disque_pourcentage)
-    {
-        return Err("Le seuil d'alerte disque doit être compris entre 0 et 100.".into());
-    }
-    Ok(())
+    config.validate().map_err(Into::into)
 }
 
 /// Actualise l'état des partitions selon la configuration courante.
@@ -218,22 +204,33 @@ async fn send_telegram_alert(
         "Alerte NetDiskMonitor : le disque {} est occupé à {:.1} % (seuil : {:.1} %).",
         disk.name, percent, config.seuil_alerte_disque_pourcentage
     );
-    client
-        .post(url)
-        .json(&serde_json::json!({
-            "chat_id": config.identifiant_chat_telegram,
-            "text": text,
-        }))
-        .send()
-        .await
-        .map_err(|error| error.without_url())?
-        .error_for_status()
-        .map_err(|error| error.without_url())?;
+    tokio::time::timeout(
+        Duration::from_secs(config.delai_http_telegram_secondes),
+        async {
+            client
+                .post(url)
+                .json(&serde_json::json!({
+                    "chat_id": config.identifiant_chat_telegram,
+                    "text": text,
+                }))
+                .send()
+                .await
+                .map_err(|error| error.without_url())?
+                .error_for_status()
+                .map_err(|error| error.without_url())?;
+            Ok::<(), Box<dyn Error + Send + Sync>>(())
+        },
+    )
+    .await
+    .map_err(|_| "Délai d'attente Telegram dépassé")??;
     Ok(())
 }
 
 /// Recherche les plus gros fichiers des volumes disponibles sans suivre les liens symboliques.
-fn scan_large_files() -> Result<Vec<LargeFileDetails>, Box<dyn Error + Send + Sync>> {
+fn scan_large_files(
+    minimum_size_bytes: u64,
+    maximum_files: usize,
+) -> Result<Vec<LargeFileDetails>, Box<dyn Error + Send + Sync>> {
     let disks = Disks::new_with_refreshed_list();
     let mut files = Vec::new();
     let mut scanned_roots = 0;
@@ -241,7 +238,7 @@ fn scan_large_files() -> Result<Vec<LargeFileDetails>, Box<dyn Error + Send + Sy
     for disk in disks.iter() {
         let root = disk.mount_point();
         let previous_count = scanned_roots;
-        visit_directory(root, &mut files, &mut scanned_roots);
+        visit_directory(root, minimum_size_bytes, &mut files, &mut scanned_roots);
         if scanned_roots == previous_count {
             eprintln!("[Analyse] Impossible de lire le volume {}", root.display());
         }
@@ -254,11 +251,16 @@ fn scan_large_files() -> Result<Vec<LargeFileDetails>, Box<dyn Error + Send + Sy
     files.sort_unstable_by(|left, right| right.size_bytes.cmp(&left.size_bytes));
     let mut unique_paths = HashSet::new();
     files.retain(|file| unique_paths.insert(file.path.clone()));
-    files.truncate(MAX_LARGE_FILES);
+    files.truncate(maximum_files);
     Ok(files)
 }
 
-fn visit_directory(path: &Path, files: &mut Vec<LargeFileDetails>, scanned_roots: &mut usize) {
+fn visit_directory(
+    path: &Path,
+    minimum_size_bytes: u64,
+    files: &mut Vec<LargeFileDetails>,
+    scanned_roots: &mut usize,
+) {
     let entries = match std::fs::read_dir(path) {
         Ok(entries) => {
             *scanned_roots += 1;
@@ -296,10 +298,10 @@ fn visit_directory(path: &Path, files: &mut Vec<LargeFileDetails>, scanned_roots
         };
 
         if file_type.is_dir() {
-            visit_directory(&entry.path(), files, scanned_roots);
+            visit_directory(&entry.path(), minimum_size_bytes, files, scanned_roots);
         } else if file_type.is_file() {
             match entry.metadata() {
-                Ok(metadata) if metadata.len() >= LARGE_FILE_MIN_BYTES => {
+                Ok(metadata) if metadata.len() >= minimum_size_bytes => {
                     files.push(LargeFileDetails {
                         path: entry.path().to_string_lossy().into_owned(),
                         size_bytes: metadata.len(),
@@ -320,11 +322,12 @@ async fn delete_selected_files(
     state: &std::sync::Arc<EngineState>,
     paths: Vec<String>,
 ) -> MessageEngineToClient {
-    if paths.is_empty() || paths.len() > MAX_LARGE_FILES {
+    let maximum_files = state.config.borrow().nombre_max_fichiers_volumineux;
+    if paths.is_empty() || paths.len() > maximum_files {
         return MessageEngineToClient::FilesDeleted {
             success: false,
             message: format!(
-                "Sélection invalide : choisissez entre 1 et {MAX_LARGE_FILES} fichiers."
+                "Sélection invalide : choisissez entre 1 et {maximum_files} fichiers."
             ),
         };
     }
@@ -529,7 +532,14 @@ async fn handle_client(
             }
         }
         Ok(MessageClientToEngine::ScanLargeFiles) => {
-            match tokio::task::spawn_blocking(scan_large_files).await {
+            let config = state.config.borrow().clone();
+            let minimum_size_bytes = config.taille_min_fichier_volumineux_mio * 1024 * 1024;
+            let maximum_files = config.nombre_max_fichiers_volumineux;
+            match tokio::task::spawn_blocking(move || {
+                scan_large_files(minimum_size_bytes, maximum_files)
+            })
+            .await
+            {
                 Ok(Ok(files)) => {
                     state.snapshot.write().await.large_files = files.clone();
                     MessageEngineToClient::LargeFilesSnapshot { files }
@@ -574,10 +584,7 @@ async fn handle_client(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        delete_selected_files, parse_arp_table, validate_config, EngineState, Snapshot,
-        DEFAULT_CONFIG_FILE,
-    };
+    use super::{delete_selected_files, parse_arp_table, validate_config, EngineState, Snapshot};
     use common::{Config, LargeFileDetails, MessageEngineToClient};
     use std::{sync::Arc, time::SystemTime};
     use tokio::sync::{watch, RwLock};
@@ -587,14 +594,30 @@ mod tests {
     ///
     /// Entrées : aucune.
     /// Sortie : aucune ; le test échoue si les intervalles ou valeurs par défaut sont incorrects.
-    fn config_file_sets_polling_intervals_and_keeps_other_defaults() {
-        let config: Config = toml::from_str(DEFAULT_CONFIG_FILE).expect("parse default config");
+    fn config_file_contains_all_settings_and_validates() {
+        let config: Config =
+            toml::from_str(include_str!("../../config.toml")).expect("parse config file");
 
         assert_eq!(config.intervalle_scrutation_disque_secondes, 60);
         assert_eq!(config.intervalle_scrutation_reseau_secondes, 30);
         assert_eq!(config.seuil_alerte_disque_pourcentage, 85.0);
+        assert_eq!(config.taille_min_fichier_volumineux_mio, 100);
+        assert_eq!(config.nombre_max_fichiers_volumineux, 100);
+        assert_eq!(config.intervalle_actualisation_ihm_secondes, 3);
         assert!(config.activer_surveillance_disque);
         assert!(config.activer_surveillance_reseau);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn generated_default_config_contains_all_settings() {
+        let serialized = toml::to_string_pretty(&Config::default()).expect("serialize defaults");
+        let config: Config = toml::from_str(&serialized).expect("parse generated defaults");
+
+        assert!(config.validate().is_ok());
+        assert_eq!(config.seuil_alerte_disque_pourcentage, 85.0);
+        assert_eq!(config.nombre_max_fichiers_volumineux, 100);
+        assert_eq!(config.adresse_ecoute_moteur, "127.0.0.1:7878");
     }
 
     #[test]

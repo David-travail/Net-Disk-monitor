@@ -3689,6 +3689,7 @@ dependencies = [
  "eframe",
  "serde_json",
  "tokio",
+ "toml",
 ]
 
 [[package]]

@@ -15,9 +15,19 @@ pub struct Config {
     pub intervalle_scrutation_disque_secondes: u64,
     pub seuil_alerte_disque_pourcentage: f32,
     pub jeton_bot_telegram: String,
+    pub delai_http_telegram_secondes: u64,
     pub identifiant_chat_telegram: String,
     pub activer_surveillance_reseau: bool,
     pub intervalle_scrutation_reseau_secondes: u64,
+    pub taille_min_fichier_volumineux_mio: u64,
+    pub nombre_max_fichiers_volumineux: usize,
+    pub adresse_ecoute_moteur: String,
+    pub adresse_moteur: String,
+    pub intervalle_actualisation_ihm_secondes: u64,
+    pub largeur_fenetre_ihm: f32,
+    pub hauteur_fenetre_ihm: f32,
+    pub largeur_min_fenetre_ihm: f32,
+    pub hauteur_min_fenetre_ihm: f32,
 }
 
 impl Default for Config {
@@ -31,10 +41,75 @@ impl Default for Config {
             intervalle_scrutation_disque_secondes: 60,
             seuil_alerte_disque_pourcentage: 85.0,
             jeton_bot_telegram: String::new(),
+            delai_http_telegram_secondes: 10,
             identifiant_chat_telegram: String::new(),
             activer_surveillance_reseau: true,
             intervalle_scrutation_reseau_secondes: 30,
+            taille_min_fichier_volumineux_mio: 100,
+            nombre_max_fichiers_volumineux: 100,
+            adresse_ecoute_moteur: "127.0.0.1:7878".to_owned(),
+            adresse_moteur: "127.0.0.1:7878".to_owned(),
+            intervalle_actualisation_ihm_secondes: 3,
+            largeur_fenetre_ihm: 900.0,
+            hauteur_fenetre_ihm: 760.0,
+            largeur_min_fenetre_ihm: 680.0,
+            hauteur_min_fenetre_ihm: 520.0,
         }
+    }
+}
+
+impl Config {
+    /// Vérifie les valeurs configurables avant leur utilisation.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.intervalle_scrutation_disque_secondes == 0
+            || self.intervalle_scrutation_reseau_secondes == 0
+            || self.intervalle_actualisation_ihm_secondes == 0
+            || self.delai_http_telegram_secondes == 0
+        {
+            return Err("Les intervalles et délais doivent être supérieurs à zéro.");
+        }
+        if !self.seuil_alerte_disque_pourcentage.is_finite()
+            || !(0.0..=100.0).contains(&self.seuil_alerte_disque_pourcentage)
+        {
+            return Err("Le seuil d'alerte disque doit être compris entre 0 et 100.");
+        }
+        if self.taille_min_fichier_volumineux_mio == 0
+            || self
+                .taille_min_fichier_volumineux_mio
+                .checked_mul(1024 * 1024)
+                .is_none()
+            || self.nombre_max_fichiers_volumineux == 0
+            || self.nombre_max_fichiers_volumineux > 10_000
+        {
+            return Err("Les réglages d'analyse des fichiers sont invalides.");
+        }
+        if self.adresse_ecoute_moteur.trim().is_empty() || self.adresse_moteur.trim().is_empty() {
+            return Err("Les adresses réseau du moteur ne peuvent pas être vides.");
+        }
+        if [
+            self.largeur_fenetre_ihm,
+            self.hauteur_fenetre_ihm,
+            self.largeur_min_fenetre_ihm,
+            self.hauteur_min_fenetre_ihm,
+        ]
+        .iter()
+        .any(|dimension| !dimension.is_finite() || *dimension <= 0.0)
+        {
+            return Err("Les dimensions de la fenêtre doivent être positives et finies.");
+        }
+        if self.largeur_fenetre_ihm < self.largeur_min_fenetre_ihm
+            || self.hauteur_fenetre_ihm < self.hauteur_min_fenetre_ihm
+        {
+            return Err(
+                "La fenêtre initiale doit être au moins aussi grande que sa taille minimale.",
+            );
+        }
+        if self.jeton_bot_telegram.is_empty() != self.identifiant_chat_telegram.is_empty() {
+            return Err(
+                "Le jeton Telegram et l'identifiant du chat doivent être configurés ensemble.",
+            );
+        }
+        Ok(())
     }
 }
 

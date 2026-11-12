@@ -1,12 +1,31 @@
-# Intervalle de vérification des disques, en secondes.
+# Surveillance disque.
+activer_surveillance_disque = true
 intervalle_scrutation_disque_secondes = 60
-
-# Intervalle de lecture de la table ARP, en secondes.
-intervalle_scrutation_reseau_secondes = 30
-
-# Pourcentage d'occupation qui declenche une alerte disque.
 seuil_alerte_disque_pourcentage = 85.0
 
-# Identifiants Telegram optionnels ; laissez-les vides jusqu'a la configuration du bot.
+# Telegram reste desactive si les deux champs sont vides.
 jeton_bot_telegram = ""
 identifiant_chat_telegram = ""
+delai_http_telegram_secondes = 10
+
+# Surveillance des appareils presents dans la table ARP locale.
+activer_surveillance_reseau = true
+intervalle_scrutation_reseau_secondes = 30
+
+# Analyse des gros fichiers : taille minimale en Mio et nombre maximal de resultats.
+taille_min_fichier_volumineux_mio = 100
+nombre_max_fichiers_volumineux = 100
+
+# Ecoute TCP du moteur. Garder 127.0.0.1 pour un acces sur cette machine uniquement.
+adresse_ecoute_moteur = "127.0.0.1:7878"
+
+# Adresse utilisee par l'IHM pour joindre le moteur.
+# Pour un moteur distant, renseigner ici son adresse IP et son port.
+adresse_moteur = "127.0.0.1:7878"
+
+# Actualisation de l'IHM et dimensions initiales/minimales de sa fenetre.
+intervalle_actualisation_ihm_secondes = 3
+largeur_fenetre_ihm = 900.0
+hauteur_fenetre_ihm = 760.0
+largeur_min_fenetre_ihm = 680.0
+hauteur_min_fenetre_ihm = 520.0

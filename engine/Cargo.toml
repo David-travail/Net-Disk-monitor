@@ -9,5 +9,5 @@ tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sysinfo = "0.30" # Pour la scrutation du disque
-toml = "0.8"
+toml.workspace = true
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

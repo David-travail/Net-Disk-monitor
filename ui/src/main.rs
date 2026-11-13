@@ -6,6 +6,9 @@
 //! Fonctions :
 //! - `NetDiskMonitorApp::new` : crée l'état de l'interface.
 //! - `NetDiskMonitorApp::receive_updates` : applique les réponses reçues du moteur.
+//! - `NetDiskMonitorApp::show_monitoring_toggles` : active/désactive les surveillances.
+//! - `stacked_blocks` : répartit la hauteur entre blocs, avec poignées de redimensionnement.
+//! - `NetDiskMonitorApp::show_*` : dessinent chaque bloc (disques, fichiers, appareils, mouvements).
 //! - `NetDiskMonitorApp::update` : dessine et actualise la fenêtre.
 //! - `main` : démarre la collecte réseau et ouvre la fenêtre graphique.
 //! - `start_status_polling` : exécute les demandes d'état périodiques en arrière-plan.
@@ -15,9 +18,10 @@
 
 use common::{
     Config, DeviceDetails, DiskDetails, LargeFileDetails, MessageClientToEngine,
-    MessageEngineToClient,
+    MessageEngineToClient, NetworkEventDetails, NetworkEventKind, MAX_ALIAS_CHARS,
 };
 use eframe::egui;
+use egui_extras::{Column, TableBuilder};
 use std::{
     collections::HashSet,
     sync::mpsc::{self, Receiver},
@@ -29,10 +33,16 @@ use tokio::{
     sync::mpsc::{self as tokio_mpsc, UnboundedSender},
 };
 
+/// Délai maximal pour établir la connexion TCP avec le moteur.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Délai maximal de réponse du moteur pour les requêtes rapides.
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
+
 #[derive(Default)]
 struct MonitorData {
     disks: Vec<DiskDetails>,
     devices: Vec<DeviceDetails>,
+    network_events: Vec<NetworkEventDetails>,
     large_files: Vec<LargeFileDetails>,
     selected_paths: HashSet<String>,
     last_error: Option<String>,
@@ -42,6 +52,8 @@ struct MonitorData {
     was_over_threshold: bool,
     threshold_percent: f32,
     confirm_deletion: bool,
+    /// État des surveillances rapporté par le moteur (`None` tant qu'il n'a pas répondu).
+    monitoring: Option<(bool, bool)>,
 }
 
 struct NetDiskMonitorApp {
@@ -53,6 +65,17 @@ struct NetDiskMonitorApp {
     minimum_file_size_mio: u64,
     maximum_files: usize,
     refresh_interval: Duration,
+    layout: BlockLayout,
+    /// Appareil en cours de renommage, avec le texte saisi.
+    alias_edit: Option<AliasEdit>,
+}
+
+/// Saisie en cours d'un nom personnalisé.
+struct AliasEdit {
+    device: DeviceDetails,
+    text: String,
+    /// Le focus clavier a déjà été placé dans le champ de saisie.
+    focused: bool,
 }
 
 impl NetDiskMonitorApp {
@@ -75,6 +98,8 @@ impl NetDiskMonitorApp {
             minimum_file_size_mio: config.taille_min_fichier_volumineux_mio,
             maximum_files: config.nombre_max_fichiers_volumineux,
             refresh_interval: Duration::from_secs(config.intervalle_actualisation_ihm_secondes),
+            layout: BlockLayout::default(),
+            alias_edit: None,
         }
     }
 
@@ -89,7 +114,13 @@ impl NetDiskMonitorApp {
                     disk_info,
                     connected_devices,
                     seuil_alerte_disque_pourcentage,
+                    surveillance_disque_active,
+                    surveillance_reseau_active,
+                    network_events,
                 }) => {
+                    self.data.network_events = network_events;
+                    self.data.monitoring =
+                        Some((surveillance_disque_active, surveillance_reseau_active));
                     self.data.disks = disk_info;
                     self.data.devices = connected_devices;
                     self.data.last_error = None;
@@ -143,6 +174,39 @@ impl NetDiskMonitorApp {
         context.request_repaint_after(Duration::from_millis(250));
     }
 
+    /// Affiche les cases d'activation des surveillances et transmet les changements au moteur.
+    ///
+    /// Les cases restent grisées tant que l'état du moteur n'est pas connu.
+    fn show_monitoring_toggles(&mut self, ui: &mut egui::Ui) {
+        let (mut disk, mut network) = self.data.monitoring.unwrap_or((false, false));
+        let enabled = self.data.monitoring.is_some();
+        let disk_changed = ui
+            .add_enabled(
+                enabled,
+                egui::Checkbox::new(&mut disk, "Surveillance disque"),
+            )
+            .changed();
+        let network_changed = ui
+            .add_enabled(
+                enabled,
+                egui::Checkbox::new(&mut network, "Surveillance réseau"),
+            )
+            .changed();
+        if disk_changed || network_changed {
+            match self.requests.send(MessageClientToEngine::SetMonitoring {
+                disque: disk,
+                reseau: network,
+            }) {
+                Ok(()) => self.data.monitoring = Some((disk, network)),
+                Err(error) => {
+                    self.data.last_error = Some(format!(
+                        "Impossible de modifier les surveillances : {error}"
+                    ));
+                }
+            }
+        }
+    }
+
     fn receive_action_result(&mut self, success: bool, message: String, refresh_files: bool) {
         self.data.is_working = false;
         self.data.last_error = None;
@@ -160,152 +224,263 @@ impl NetDiskMonitorApp {
     }
 }
 
-impl eframe::App for NetDiskMonitorApp {
-    /// Dessine la fenêtre et demande le traitement des réponses réseau disponibles.
-    ///
-    /// Entrées : `self`, données affichées ; `context`, contexte egui ;
-    /// `_frame`, fenêtre native fournie par eframe.
-    /// Sortie : aucune ; met à jour l'interface graphique.
-    fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
-        self.receive_updates(context);
+/// Couleurs de statut lisibles en thème clair comme en thème sombre.
+mod colors {
+    use eframe::egui::{Color32, Ui};
 
-        egui::TopBottomPanel::top("header").show(context, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading("NetDiskMonitor");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(format!(
-                        "Actualisation toutes les {} secondes",
-                        self.refresh_interval.as_secs()
-                    ));
+    /// Vert : connecté, succès.
+    pub fn ok(ui: &Ui) -> Color32 {
+        if ui.visuals().dark_mode {
+            Color32::LIGHT_GREEN
+        } else {
+            Color32::from_rgb(0, 128, 0)
+        }
+    }
+
+    /// Rouge : erreur, déconnexion, seuil dépassé.
+    pub fn error(ui: &Ui) -> Color32 {
+        if ui.visuals().dark_mode {
+            Color32::LIGHT_RED
+        } else {
+            Color32::from_rgb(190, 30, 30)
+        }
+    }
+
+    /// Orange : avertissement (appareil qui ne répond plus, MAC privée).
+    pub fn warning(ui: &Ui) -> Color32 {
+        if ui.visuals().dark_mode {
+            Color32::from_rgb(230, 170, 60)
+        } else {
+            Color32::from_rgb(180, 95, 0)
+        }
+    }
+
+    /// Gris : élément atténué.
+    pub fn dimmed(ui: &Ui) -> Color32 {
+        ui.visuals().weak_text_color()
+    }
+}
+
+/// Blocs affichés dans la zone centrale.
+#[derive(Clone, Copy)]
+enum Block {
+    Disks,
+    LargeFiles,
+    Devices,
+    Events,
+}
+
+/// Largeur de fenêtre à partir de laquelle les blocs sont répartis sur deux colonnes.
+const TWO_COLUMNS_MIN_WIDTH: f32 = 1000.0;
+/// Hauteur minimale d'un bloc, en pixels.
+const MIN_BLOCK_HEIGHT: f32 = 70.0;
+/// Hauteur de la poignée de redimensionnement entre deux blocs.
+const SPLITTER_HEIGHT: f32 = 8.0;
+
+/// Parts relatives de la hauteur attribuées à chaque bloc, modifiables à la souris.
+#[derive(Clone, Copy)]
+struct BlockLayout {
+    /// Une colonne : disques, fichiers, appareils, mouvements.
+    single: [f32; 4],
+    /// Deux colonnes : disques et fichiers à gauche.
+    left: [f32; 2],
+    /// Deux colonnes : appareils et mouvements à droite.
+    right: [f32; 2],
+}
+
+impl Default for BlockLayout {
+    fn default() -> Self {
+        Self {
+            single: [1.0, 1.5, 1.5, 1.0],
+            left: [1.0, 2.0],
+            right: [2.0, 1.0],
+        }
+    }
+}
+
+/// Empile des blocs verticalement : chacun reçoit une part de la hauteur disponible
+/// proportionnelle à son poids, et les poignées entre blocs modifient ces poids.
+///
+/// Entrées : `ui`, zone à remplir ; `weights`, poids
+/// des blocs (mis à jour lors d'un glissement) ; `draw`, dessine le bloc d'indice donné.
+fn stacked_blocks(
+    ui: &mut egui::Ui,
+    weights: &mut [f32],
+    mut draw: impl FnMut(usize, &mut egui::Ui),
+) {
+    let count = weights.len();
+    let width = ui.available_width();
+    let total = (ui.available_height() - SPLITTER_HEIGHT * (count - 1) as f32)
+        .max(MIN_BLOCK_HEIGHT * count as f32);
+    let sum: f32 = weights.iter().sum();
+
+    for index in 0..count {
+        let height = total * weights[index] / sum;
+        ui.allocate_ui_with_layout(
+            egui::vec2(width, height),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.set_min_size(ui.available_size());
+                    draw(index, ui);
                 });
-            });
+            },
+        );
+
+        if index + 1 < count {
+            let (rect, response) =
+                ui.allocate_exact_size(egui::vec2(width, SPLITTER_HEIGHT), egui::Sense::drag());
+            let response = response.on_hover_cursor(egui::CursorIcon::ResizeVertical);
+            let stroke = if response.hovered() || response.dragged() {
+                ui.visuals().widgets.active.fg_stroke
+            } else {
+                ui.visuals().widgets.noninteractive.bg_stroke
+            };
+            ui.painter().hline(rect.x_range(), rect.center().y, stroke);
+            if response.dragged() {
+                let delta = response.drag_delta().y / total * sum;
+                let minimum = MIN_BLOCK_HEIGHT / total * sum;
+                let pair = weights[index] + weights[index + 1];
+                let upper = (weights[index] + delta).clamp(minimum, (pair - minimum).max(minimum));
+                weights[index] = upper;
+                weights[index + 1] = pair - upper;
+            }
+        }
+    }
+}
+
+impl NetDiskMonitorApp {
+    /// Dessine le bloc demandé.
+    ///
+    /// Chaque bloc reçoit son propre espace d'identifiants : sans cela, les poignées de
+    /// colonnes des tableaux `egui_extras` (dérivées de l'identifiant du parent) entrent
+    /// en conflit d'un bloc à l'autre.
+    fn show_block(&mut self, block: Block, ui: &mut egui::Ui) {
+        let id = match block {
+            Block::Disks => "block_disks",
+            Block::LargeFiles => "block_large_files",
+            Block::Devices => "block_devices",
+            Block::Events => "block_events",
+        };
+        ui.push_id(id, |ui| match block {
+            Block::Disks => self.show_disks(ui),
+            Block::LargeFiles => self.show_large_files(ui),
+            Block::Devices => self.show_devices(ui),
+            Block::Events => self.show_events(ui),
         });
+    }
 
-        egui::CentralPanel::default().show(context, |ui| {
-            if let Some(error) = &self.configuration_error {
-                ui.colored_label(egui::Color32::LIGHT_RED, format!("Configuration : {error}"));
-                ui.add_space(8.0);
-            }
-            if let Some(error) = &self.data.last_error {
-                ui.colored_label(egui::Color32::LIGHT_RED, format!("Erreur : {error}"));
-                ui.add_space(8.0);
-            }
-            if let Some((success, message)) = &self.data.status_message {
-                let color = if *success {
-                    egui::Color32::LIGHT_GREEN
-                } else {
-                    egui::Color32::LIGHT_RED
-                };
-                ui.colored_label(color, message);
-                ui.add_space(8.0);
-            }
+    /// Affiche les erreurs et le dernier message d'action.
+    fn show_messages(&self, ui: &mut egui::Ui) {
+        if let Some(error) = &self.configuration_error {
+            ui.colored_label(colors::error(ui), format!("Configuration : {error}"));
+        }
+        if let Some(error) = &self.data.last_error {
+            ui.colored_label(colors::error(ui), format!("Erreur : {error}"));
+        }
+        if let Some((success, message)) = &self.data.status_message {
+            let color = if *success {
+                colors::ok(ui)
+            } else {
+                colors::error(ui)
+            };
+            ui.colored_label(color, message);
+        }
+    }
 
+    /// Bloc « Occupation des disques ».
+    fn show_disks(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
             ui.heading("Occupation des disques");
             ui.label(format!(
                 "Seuil d'alerte : {:.1} %",
                 self.data.threshold_percent
             ));
-            ui.add_space(6.0);
-            if self.data.disks.is_empty() {
-                ui.label("Aucun disque disponible. Vérifiez que le moteur est démarré.");
-            } else {
+        });
+        if matches!(self.data.monitoring, Some((false, _))) {
+            ui.label("Surveillance disque désactivée.");
+            return;
+        }
+        if self.data.disks.is_empty() {
+            ui.label("Aucun disque disponible. Vérifiez que le moteur est démarré.");
+            return;
+        }
+        egui::ScrollArea::vertical()
+            .id_salt("disks_scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
                 for disk in &self.data.disks {
-                    let percent = if disk.total_bytes == 0 {
+                    let ratio = if disk.total_bytes == 0 {
                         0.0
                     } else {
                         disk.used_bytes as f32 / disk.total_bytes as f32
                     };
-                    ui.group(|ui| {
-                        ui.horizontal(|ui| {
-                            ui.strong(&disk.name);
-                            ui.label(format!(
-                                "{} utilisés sur {}",
-                                format_bytes(disk.used_bytes),
-                                format_bytes(disk.total_bytes)
-                            ));
-                        });
-                        let progress = egui::ProgressBar::new(percent.clamp(0.0, 1.0))
-                            .text(format!("{:.1} %", percent * 100.0));
-                        ui.add(progress);
+                    let over = ratio * 100.0 >= self.data.threshold_percent;
+                    ui.horizontal(|ui| {
+                        ui.strong(&disk.name);
+                        ui.label(format!(
+                            "{} utilisés sur {}",
+                            format_bytes(disk.used_bytes),
+                            format_bytes(disk.total_bytes)
+                        ));
                     });
+                    let mut progress = egui::ProgressBar::new(ratio.clamp(0.0, 1.0))
+                        .desired_width(ui.available_width())
+                        .text(format!("{:.1} %", ratio * 100.0));
+                    if over {
+                        progress = progress.fill(colors::error(ui));
+                    }
+                    ui.add(progress);
                     ui.add_space(4.0);
                 }
-            }
+            });
+    }
 
-            ui.add_space(12.0);
-            ui.horizontal(|ui| {
-                ui.heading("Fichiers volumineux");
-                if ui
-                    .add_enabled(
-                        !self.data.is_working,
-                        egui::Button::new("Analyser les disques"),
-                    )
-                    .clicked()
-                {
-                    self.data.last_error = None;
-                    self.data.status_message = None;
-                    match self.requests.send(MessageClientToEngine::ScanLargeFiles) {
-                        Ok(()) => self.data.is_working = true,
-                        Err(error) => {
-                            self.data.last_error = Some(format!(
-                                "Impossible d'envoyer la demande d'analyse : {error}"
-                            ))
-                        }
+    /// Bloc « Fichiers volumineux » : analyse, sélection et suppression.
+    fn show_large_files(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            ui.heading("Fichiers volumineux");
+            if ui
+                .add_enabled(
+                    !self.data.is_working,
+                    egui::Button::new("Analyser les disques"),
+                )
+                .clicked()
+            {
+                self.data.last_error = None;
+                self.data.status_message = None;
+                match self.requests.send(MessageClientToEngine::ScanLargeFiles) {
+                    Ok(()) => self.data.is_working = true,
+                    Err(error) => {
+                        self.data.last_error = Some(format!(
+                            "Impossible d'envoyer la demande d'analyse : {error}"
+                        ))
                     }
                 }
-            });
-            ui.label(format!(
-                "Fichiers d'au moins {} Mio ; les {} plus volumineux sont affichés.",
-                self.minimum_file_size_mio, self.maximum_files
-            ));
+            }
             if self.data.is_working {
+                ui.spinner();
                 ui.label("Opération en cours…");
             }
+        });
+        ui.label(format!(
+            "Fichiers d'au moins {} Mio ; les {} plus volumineux sont affichés.",
+            self.minimum_file_size_mio, self.maximum_files
+        ));
 
-            if self.data.large_files.is_empty() {
-                if self.data.has_scanned {
-                    ui.label("Aucun fichier correspondant trouvé sur les disques accessibles.");
-                } else {
-                    ui.label("Lancez une analyse pour rechercher les fichiers volumineux.");
-                }
+        if self.data.large_files.is_empty() {
+            if self.data.has_scanned {
+                ui.label("Aucun fichier correspondant trouvé sur les disques accessibles.");
             } else {
-                let files = self.data.large_files.clone();
-                let path_column_width = (ui.available_width() - 140.0).clamp(120.0, 500.0);
-                egui::ScrollArea::vertical()
-                    .max_height(220.0)
-                    .show(ui, |ui| {
-                        egui::Grid::new("large_files")
-                            .striped(true)
-                            .num_columns(3)
-                            .show(ui, |ui| {
-                                ui.strong("Sélection");
-                                ui.add_sized(
-                                    [path_column_width, ui.spacing().interact_size.y],
-                                    egui::Label::new("Fichier"),
-                                );
-                                ui.strong("Poids");
-                                ui.end_row();
+                ui.label("Lancez une analyse pour rechercher les fichiers volumineux.");
+            }
+            return;
+        }
 
-                                for file in files {
-                                    let mut selected =
-                                        self.data.selected_paths.contains(&file.path);
-                                    if ui.checkbox(&mut selected, "").changed() {
-                                        if selected {
-                                            self.data.selected_paths.insert(file.path.clone());
-                                        } else {
-                                            self.data.selected_paths.remove(&file.path);
-                                        }
-                                    }
-                                    ui.add_sized(
-                                        [path_column_width, ui.spacing().interact_size.y],
-                                        egui::Label::new(file_display_name(&file.path)).truncate(),
-                                    )
-                                    .on_hover_text(&file.path);
-                                    ui.monospace(format_bytes(file.size_bytes));
-                                    ui.end_row();
-                                }
-                            });
-                    });
+        // La ligne d'actions est placée en bas ; le tableau occupe le reste.
+        egui::TopBottomPanel::bottom("large_files_actions")
+            .frame(egui::Frame::NONE)
+            .show_inside(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(format!(
                         "{} fichier(s) sélectionné(s)",
@@ -321,69 +496,372 @@ impl eframe::App for NetDiskMonitorApp {
                         self.data.confirm_deletion = true;
                     }
                 });
-            }
+            });
 
-            ui.add_space(12.0);
-            ui.heading("Appareils du réseau local");
-            ui.add_space(6.0);
-            if self.data.devices.is_empty() {
-                ui.label("Aucun appareil détecté dans la table ARP.");
-            } else {
-                egui::Grid::new("network_devices")
-                    .striped(true)
-                    .num_columns(3)
-                    .show(ui, |ui| {
-                        ui.strong("Adresse IP");
-                        ui.strong("Adresse MAC");
-                        ui.strong("Nom");
-                        ui.end_row();
-
-                        for device in &self.data.devices {
-                            ui.label(&device.ip);
-                            ui.label(&device.mac);
-                            ui.label(device.hostname.as_deref().unwrap_or("—"));
-                            ui.end_row();
-                        }
-                    });
-            }
-        });
-
-        if self.data.confirm_deletion {
-            egui::Window::new("Confirmer la suppression")
-                .collapsible(false)
-                .resizable(false)
-                .show(context, |ui| {
-                    ui.label(format!(
-                        "Supprimer définitivement {} fichier(s) sélectionné(s) ?",
-                        self.data.selected_paths.len()
-                    ));
-                    ui.horizontal(|ui| {
-                        if ui.button("Annuler").clicked() {
-                            self.data.confirm_deletion = false;
-                        }
-                        if ui.button("Supprimer").clicked() {
-                            let paths = self.data.selected_paths.iter().cloned().collect();
-                            match self
-                                .requests
-                                .send(MessageClientToEngine::DeleteFiles { paths })
-                            {
-                                Ok(()) => {
-                                    self.data.is_working = true;
-                                    self.data.confirm_deletion = false;
-                                    self.data.last_error = None;
-                                    self.data.status_message = None;
-                                }
-                                Err(error) => {
-                                    self.data.last_error = Some(format!(
-                                        "Impossible d'envoyer la suppression : {error}"
-                                    ));
-                                }
+        let row_height = ui.spacing().interact_size.y;
+        let files = &self.data.large_files;
+        let selected_paths = &mut self.data.selected_paths;
+        TableBuilder::new(ui)
+            .id_salt("large_files_table")
+            .striped(true)
+            .resizable(true)
+            .auto_shrink([false, false])
+            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+            .column(Column::exact(24.0))
+            .column(Column::remainder().at_least(120.0).clip(true))
+            .column(Column::auto().at_least(80.0))
+            .header(row_height, |mut header| {
+                header.col(|_| {});
+                header.col(|ui| {
+                    ui.strong("Fichier");
+                });
+                header.col(|ui| {
+                    ui.strong("Poids");
+                });
+            })
+            .body(|body| {
+                body.rows(row_height, files.len(), |mut row| {
+                    let file = &files[row.index()];
+                    row.col(|ui| {
+                        let mut selected = selected_paths.contains(&file.path);
+                        if ui.checkbox(&mut selected, "").changed() {
+                            if selected {
+                                selected_paths.insert(file.path.clone());
+                            } else {
+                                selected_paths.remove(&file.path);
                             }
                         }
                     });
+                    row.col(|ui| {
+                        ui.add(egui::Label::new(file_display_name(&file.path)).truncate())
+                            .on_hover_text(&file.path);
+                    });
+                    row.col(|ui| {
+                        ui.monospace(format_bytes(file.size_bytes));
+                    });
                 });
+            });
+    }
+
+    /// Bloc « Appareils du réseau local ».
+    fn show_devices(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.heading("Appareils du réseau local");
+            if !self.data.devices.is_empty() {
+                ui.label(format!("{} appareil(s)", self.data.devices.len()));
+            }
+        });
+        if matches!(self.data.monitoring, Some((_, false))) {
+            ui.label("Surveillance réseau désactivée.");
+            return;
+        }
+        if self.data.devices.is_empty() {
+            ui.label("Aucun appareil détecté dans la table ARP.");
+            return;
         }
 
+        let row_height = ui.spacing().interact_size.y;
+        let devices = &self.data.devices;
+        let mut edit_request = None;
+        let dimmed = colors::dimmed(ui);
+        TableBuilder::new(ui)
+            .id_salt("devices_table")
+            .striped(true)
+            .resizable(true)
+            .auto_shrink([false, false])
+            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+            .column(Column::initial(115.0).at_least(80.0).clip(true))
+            .column(Column::initial(140.0).at_least(80.0).clip(true))
+            .column(Column::remainder().at_least(100.0).clip(true))
+            .column(Column::initial(170.0).at_least(80.0).clip(true))
+            .column(Column::exact(28.0))
+            .header(row_height, |mut header| {
+                for title in ["Adresse IP", "Adresse MAC", "Nom", "État", ""] {
+                    header.col(|ui| {
+                        ui.strong(title);
+                    });
+                }
+            })
+            .body(|body| {
+                body.rows(row_height, devices.len(), |mut row| {
+                    let device = &devices[row.index()];
+                    let responding = device.scans_manques == 0;
+                    let color = if responding { None } else { Some(dimmed) };
+                    let cell = |ui: &mut egui::Ui, text: egui::RichText| {
+                        let text = match color {
+                            Some(color) => text.color(color),
+                            None => text,
+                        };
+                        ui.add(egui::Label::new(text).truncate())
+                    };
+                    row.col(|ui| {
+                        cell(ui, egui::RichText::new(&device.ip));
+                    });
+                    row.col(|ui| {
+                        let response = cell(ui, egui::RichText::new(&device.mac));
+                        if device.has_private_mac() {
+                            response.on_hover_text(
+                                "Adresse MAC privée (aléatoire) : l'appareil peut en changer.",
+                            );
+                        }
+                    });
+                    row.col(|ui| {
+                        let response = match &device.alias {
+                            Some(alias) => cell(ui, egui::RichText::new(alias).strong()),
+                            None => cell(
+                                ui,
+                                egui::RichText::new(device.hostname.as_deref().unwrap_or("—")),
+                            ),
+                        };
+                        let detected = device.hostname.as_deref().unwrap_or("aucun");
+                        let response = response
+                            .on_hover_text(format!("Nom détecté sur le réseau : {detected}"));
+                        if response.double_clicked() {
+                            edit_request = Some(device.clone());
+                        }
+                    });
+                    row.col(|ui| {
+                        if responding {
+                            ui.colored_label(colors::ok(ui), "connecté");
+                        } else {
+                            ui.colored_label(
+                                colors::warning(ui),
+                                format!("ne répond plus ({} scan(s))", device.scans_manques),
+                            );
+                        }
+                    });
+                    row.col(|ui| {
+                        if ui
+                            .small_button("✏")
+                            .on_hover_text("Donner un nom à cet appareil")
+                            .clicked()
+                        {
+                            edit_request = Some(device.clone());
+                        }
+                    });
+                });
+            });
+
+        if let Some(device) = edit_request {
+            let text = device.alias.clone().unwrap_or_default();
+            self.alias_edit = Some(AliasEdit {
+                device,
+                text,
+                focused: false,
+            });
+        }
+    }
+
+    /// Fenêtre de saisie du nom personnalisé d'un appareil.
+    fn show_alias_dialog(&mut self, context: &egui::Context) {
+        let Some(edit) = &mut self.alias_edit else {
+            return;
+        };
+        let mut action: Option<Option<String>> = None; // Some(nom) : envoyer ; None : rien
+        let mut close = false;
+        egui::Window::new("Nommer l'appareil")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(context, |ui| {
+                egui::Grid::new("alias_device_info")
+                    .num_columns(2)
+                    .show(ui, |ui| {
+                        ui.label("Adresse IP");
+                        ui.monospace(&edit.device.ip);
+                        ui.end_row();
+                        ui.label("Adresse MAC");
+                        ui.monospace(&edit.device.mac);
+                        ui.end_row();
+                        ui.label("Nom détecté");
+                        ui.label(edit.device.hostname.as_deref().unwrap_or("aucun"));
+                        ui.end_row();
+                    });
+                if edit.device.has_private_mac() {
+                    ui.colored_label(
+                        colors::warning(ui),
+                        "Adresse MAC privée : si l'appareil en change, le nom ne le suivra pas.",
+                    );
+                }
+                ui.add_space(6.0);
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut edit.text)
+                        .hint_text("Ex. : Caméra entrée")
+                        .char_limit(MAX_ALIAS_CHARS)
+                        .desired_width(280.0),
+                );
+                if !edit.focused {
+                    response.request_focus();
+                    edit.focused = true;
+                }
+                let submitted =
+                    response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Enregistrer").clicked() || submitted {
+                        action = Some(Some(edit.text.trim().to_owned()));
+                    }
+                    if edit.device.alias.is_some() && ui.button("Retirer le nom").clicked() {
+                        action = Some(Some(String::new()));
+                    }
+                    if ui.button("Annuler").clicked()
+                        || ui.input(|input| input.key_pressed(egui::Key::Escape))
+                    {
+                        close = true;
+                    }
+                });
+            });
+
+        if let Some(Some(alias)) = action {
+            let mac = edit.device.mac.clone();
+            match self.requests.send(MessageClientToEngine::SetDeviceAlias {
+                mac: mac.clone(),
+                alias: alias.clone(),
+            }) {
+                Ok(()) => {
+                    // Affichage immédiat, confirmé au prochain état reçu du moteur.
+                    let alias = Some(alias).filter(|alias| !alias.is_empty());
+                    for device in self.data.devices.iter_mut().filter(|d| d.mac == mac) {
+                        device.alias = alias.clone();
+                    }
+                    close = true;
+                }
+                Err(error) => {
+                    self.data.last_error =
+                        Some(format!("Impossible d'enregistrer le nom : {error}"));
+                }
+            }
+        }
+        if close {
+            self.alias_edit = None;
+        }
+    }
+
+    /// Bloc « Mouvements récents » : connexions et déconnexions, la plus récente en premier.
+    fn show_events(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Mouvements récents");
+        let movements: Vec<_> = self
+            .data
+            .network_events
+            .iter()
+            .rev()
+            .filter(|event| event.kind != NetworkEventKind::Present)
+            .collect();
+        if movements.is_empty() {
+            ui.label("Aucune connexion ni déconnexion depuis le démarrage du moteur.");
+            return;
+        }
+
+        let row_height = ui.spacing().interact_size.y;
+        TableBuilder::new(ui)
+            .id_salt("events_table")
+            .striped(true)
+            .resizable(true)
+            .auto_shrink([false, false])
+            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+            .column(Column::initial(150.0).at_least(80.0).clip(true))
+            .column(Column::initial(100.0).at_least(70.0).clip(true))
+            .column(Column::initial(250.0).at_least(100.0).clip(true))
+            .column(Column::remainder().at_least(80.0).clip(true))
+            .header(row_height, |mut header| {
+                for title in ["Heure", "Mouvement", "Appareil", "Nom"] {
+                    header.col(|ui| {
+                        ui.strong(title);
+                    });
+                }
+            })
+            .body(|body| {
+                body.rows(row_height, movements.len(), |mut row| {
+                    let event = movements[row.index()];
+                    row.col(|ui| {
+                        ui.monospace(&event.timestamp);
+                    });
+                    row.col(|ui| {
+                        if event.kind == NetworkEventKind::Deconnexion {
+                            ui.colored_label(colors::error(ui), "Déconnexion");
+                        } else {
+                            ui.colored_label(colors::ok(ui), "Connexion");
+                        }
+                    });
+                    row.col(|ui| {
+                        ui.add(
+                            egui::Label::new(format!("{} ({})", event.device.ip, event.device.mac))
+                                .truncate(),
+                        );
+                    });
+                    row.col(|ui| {
+                        ui.add(
+                            egui::Label::new(event.device.display_name().unwrap_or("—")).truncate(),
+                        );
+                    });
+                });
+            });
+    }
+
+    /// Fenêtre de confirmation de suppression des fichiers sélectionnés.
+    fn show_deletion_dialog(&mut self, context: &egui::Context) {
+        if !self.data.confirm_deletion {
+            return;
+        }
+        egui::Window::new("Confirmer la suppression")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(context, |ui| {
+                ui.label(format!(
+                    "Supprimer définitivement {} fichier(s) sélectionné(s) ?",
+                    self.data.selected_paths.len()
+                ));
+                ui.horizontal(|ui| {
+                    if ui.button("Annuler").clicked() {
+                        self.data.confirm_deletion = false;
+                    }
+                    if ui.button("Supprimer").clicked() {
+                        let paths = self.data.selected_paths.iter().cloned().collect();
+                        match self
+                            .requests
+                            .send(MessageClientToEngine::DeleteFiles { paths })
+                        {
+                            Ok(()) => {
+                                self.data.is_working = true;
+                                self.data.confirm_deletion = false;
+                                self.data.last_error = None;
+                                self.data.status_message = None;
+                            }
+                            Err(error) => {
+                                self.data.last_error =
+                                    Some(format!("Impossible d'envoyer la suppression : {error}"));
+                            }
+                        }
+                    }
+                });
+            });
+    }
+}
+
+impl eframe::App for NetDiskMonitorApp {
+    /// Dessine la fenêtre et demande le traitement des réponses réseau disponibles.
+    ///
+    /// Les blocs se partagent la hauteur de la fenêtre ; au-delà de `TWO_COLUMNS_MIN_WIDTH`
+    /// pixels de large, ils sont répartis sur deux colonnes.
+    fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
+        self.receive_updates(context);
+
+        egui::TopBottomPanel::top("header").show(context, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.heading("NetDiskMonitor");
+                ui.separator();
+                self.show_monitoring_toggles(ui);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(format!(
+                        "Actualisation toutes les {} secondes",
+                        self.refresh_interval.as_secs()
+                    ));
+                });
+            });
+        });
+
+        // Les panneaux du bas doivent être déclarés avant le panneau central.
         egui::TopBottomPanel::bottom("footer").show(context, |ui| {
             ui.horizontal(|ui| {
                 ui.label(format!("Moteur : {}", self.engine_address));
@@ -391,6 +869,39 @@ impl eframe::App for NetDiskMonitorApp {
                 ui.label("État actualisé automatiquement");
             });
         });
+
+        egui::CentralPanel::default().show(context, |ui| {
+            self.show_messages(ui);
+
+            let mut layout = self.layout;
+            if ui.available_width() >= TWO_COLUMNS_MIN_WIDTH {
+                ui.columns(2, |columns| {
+                    let (left, right) = columns.split_at_mut(1);
+                    stacked_blocks(&mut left[0], &mut layout.left, |index, ui| {
+                        let block = [Block::Disks, Block::LargeFiles][index];
+                        self.show_block(block, ui);
+                    });
+                    stacked_blocks(&mut right[0], &mut layout.right, |index, ui| {
+                        let block = [Block::Devices, Block::Events][index];
+                        self.show_block(block, ui);
+                    });
+                });
+            } else {
+                stacked_blocks(ui, &mut layout.single, |index, ui| {
+                    let block = [
+                        Block::Disks,
+                        Block::LargeFiles,
+                        Block::Devices,
+                        Block::Events,
+                    ][index];
+                    self.show_block(block, ui);
+                });
+            }
+            self.layout = layout;
+        });
+
+        self.show_deletion_dialog(context);
+        self.show_alias_dialog(context);
     }
 }
 
@@ -487,8 +998,14 @@ async fn request_engine(
     request: MessageClientToEngine,
     engine_address: &str,
 ) -> Result<MessageEngineToClient, String> {
-    let stream = TcpStream::connect(engine_address)
+    // L'analyse des disques et la suppression peuvent être longues : pas de délai de réponse.
+    let response_timeout = match request {
+        MessageClientToEngine::ScanLargeFiles | MessageClientToEngine::DeleteFiles { .. } => None,
+        _ => Some(RESPONSE_TIMEOUT),
+    };
+    let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(engine_address))
         .await
+        .map_err(|_| "Délai de connexion au moteur dépassé.".to_owned())?
         .map_err(|error| error.to_string())?;
     let (read_half, mut write_half) = stream.into_split();
     let request = serde_json::to_vec(&request).map_err(|error| error.to_string())?;
@@ -502,10 +1019,15 @@ async fn request_engine(
         .map_err(|error| error.to_string())?;
 
     let mut response_line = String::new();
-    BufReader::new(read_half)
-        .read_line(&mut response_line)
-        .await
-        .map_err(|error| error.to_string())?;
+    let mut reader = BufReader::new(read_half);
+    let read = reader.read_line(&mut response_line);
+    match response_timeout {
+        Some(limit) => tokio::time::timeout(limit, read)
+            .await
+            .map_err(|_| "Le moteur n'a pas répondu à temps.".to_owned())?,
+        None => read.await,
+    }
+    .map_err(|error| error.to_string())?;
     if response_line.is_empty() {
         return Err("Le moteur a fermé la connexion sans réponse.".into());
     }
@@ -547,11 +1069,14 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
-fn file_display_name(path: &str) -> &str {
-    std::path::Path::new(path)
-        .file_name()
-        .and_then(|name| name.to_str())
+fn file_display_name(path: &str) -> String {
+    let normalized = path.replace('\\', "/");
+    normalized
+        .rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty())
         .unwrap_or(path)
+        .to_owned()
 }
 
 #[cfg(test)]

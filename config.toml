@@ -11,6 +11,11 @@ delai_http_telegram_secondes = 10
 # Surveillance des appareils presents dans la table ARP locale.
 activer_surveillance_reseau = true
 intervalle_scrutation_reseau_secondes = 30
+# Alerte Telegram lorsqu'un appareil jamais vu depuis le demarrage du moteur apparait.
+alerte_nouvel_appareil_telegram = true
+# Nombre de scans consecutifs sans reponse avant de declarer un appareil deconnecte.
+# Delai de detection d'un depart : environ ce nombre x intervalle_scrutation_reseau_secondes.
+scans_manques_avant_deconnexion = 2
 
 # Analyse des gros fichiers : taille minimale en Mio et nombre maximal de resultats.
 taille_min_fichier_volumineux_mio = 100

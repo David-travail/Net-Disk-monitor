@@ -44,3 +44,6 @@ Desktop.ini
 *.log
 *.tmp
 *.bak
+# Noms personnalises des appareils (propres a chaque installation)
+noms_appareils.toml
+noms_appareils.toml.tmp

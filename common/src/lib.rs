@@ -19,6 +19,8 @@ pub struct Config {
     pub identifiant_chat_telegram: String,
     pub activer_surveillance_reseau: bool,
     pub intervalle_scrutation_reseau_secondes: u64,
+    pub alerte_nouvel_appareil_telegram: bool,
+    pub scans_manques_avant_deconnexion: u8,
     pub taille_min_fichier_volumineux_mio: u64,
     pub nombre_max_fichiers_volumineux: usize,
     pub adresse_ecoute_moteur: String,
@@ -45,6 +47,8 @@ impl Default for Config {
             identifiant_chat_telegram: String::new(),
             activer_surveillance_reseau: true,
             intervalle_scrutation_reseau_secondes: 30,
+            alerte_nouvel_appareil_telegram: true,
+            scans_manques_avant_deconnexion: 2,
             taille_min_fichier_volumineux_mio: 100,
             nombre_max_fichiers_volumineux: 100,
             adresse_ecoute_moteur: "127.0.0.1:7878".to_owned(),
@@ -65,8 +69,11 @@ impl Config {
             || self.intervalle_scrutation_reseau_secondes == 0
             || self.intervalle_actualisation_ihm_secondes == 0
             || self.delai_http_telegram_secondes == 0
+            || self.scans_manques_avant_deconnexion == 0
         {
-            return Err("Les intervalles et délais doivent être supérieurs à zéro.");
+            return Err(
+                "Les intervalles, délais et nombres de scans manqués doivent être supérieurs à zéro.",
+            );
         }
         if !self.seuil_alerte_disque_pourcentage.is_finite()
             || !(0.0..=100.0).contains(&self.seuil_alerte_disque_pourcentage)
@@ -118,8 +125,20 @@ impl Config {
 pub enum MessageClientToEngine {
     GetStatus,
     ScanLargeFiles,
-    DeleteFiles { paths: Vec<String> },
+    DeleteFiles {
+        paths: Vec<String>,
+    },
     UpdateConfig(Config),
+    /// Active ou désactive à chaud les surveillances, sans modifier `config.toml`.
+    SetMonitoring {
+        disque: bool,
+        reseau: bool,
+    },
+    /// Associe un nom personnalisé à une adresse MAC ; un nom vide supprime l'association.
+    SetDeviceAlias {
+        mac: String,
+        alias: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -128,6 +147,10 @@ pub enum MessageEngineToClient {
         disk_info: Vec<DiskDetails>,
         connected_devices: Vec<DeviceDetails>,
         seuil_alerte_disque_pourcentage: f32,
+        surveillance_disque_active: bool,
+        surveillance_reseau_active: bool,
+        /// Derniers mouvements réseau, du plus ancien au plus récent.
+        network_events: Vec<NetworkEventDetails>,
     },
     LargeFilesSnapshot {
         files: Vec<LargeFileDetails>,
@@ -154,6 +177,58 @@ pub struct DeviceDetails {
     pub ip: String,
     pub mac: String,
     pub hostname: Option<String>,
+    /// Nombre de scans consécutifs sans réponse (0 si l'appareil vient de répondre).
+    #[serde(default)]
+    pub scans_manques: u8,
+    /// Nom personnalisé donné par l'utilisateur, prioritaire sur `hostname`.
+    #[serde(default)]
+    pub alias: Option<String>,
+}
+
+impl DeviceDetails {
+    /// Nom à afficher : nom personnalisé, sinon nom découvert sur le réseau.
+    pub fn display_name(&self) -> Option<&str> {
+        self.alias.as_deref().or(self.hostname.as_deref())
+    }
+
+    /// Indique une adresse MAC privée (aléatoire), que l'appareil peut changer.
+    pub fn has_private_mac(&self) -> bool {
+        u8::from_str_radix(self.mac.get(0..2).unwrap_or("00"), 16)
+            .map(|first| first & 0x02 != 0)
+            .unwrap_or(false)
+    }
+}
+
+/// Longueur maximale d'un nom personnalisé d'appareil, en caractères.
+pub const MAX_ALIAS_CHARS: usize = 64;
+
+/// Nature d'un mouvement d'appareil sur le réseau local.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum NetworkEventKind {
+    /// Appareil déjà présent lors du premier scan.
+    Present,
+    Connexion,
+    Deconnexion,
+}
+
+impl NetworkEventKind {
+    /// Libellé utilisé dans la console et dans `network_events.log`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Present => "PRESENT",
+            Self::Connexion => "CONNEXION",
+            Self::Deconnexion => "DECONNEXION",
+        }
+    }
+}
+
+/// Mouvement horodaté d'un appareil.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NetworkEventDetails {
+    /// Date et heure locales au format `AAAA-MM-JJ HH:MM:SS`.
+    pub timestamp: String,
+    pub kind: NetworkEventKind,
+    pub device: DeviceDetails,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -181,6 +256,25 @@ mod tests {
     }
 
     #[test]
+    /// Vérifie le nom affiché et la détection des adresses MAC privées.
+    fn device_display_name_and_private_mac() {
+        let mut device = super::DeviceDetails {
+            ip: "192.168.1.10".to_owned(),
+            mac: "06:79:79:bb:d8:34".to_owned(),
+            hostname: Some("Myrtille".to_owned()),
+            scans_manques: 0,
+            alias: None,
+        };
+        assert_eq!(device.display_name(), Some("Myrtille"));
+        assert!(device.has_private_mac());
+
+        device.alias = Some("Téléphone".to_owned());
+        device.mac = "ec:71:db:9d:67:da".to_owned();
+        assert_eq!(device.display_name(), Some("Téléphone"));
+        assert!(!device.has_private_mac());
+    }
+
+    #[test]
     /// Vérifie que les messages client et moteur sont sérialisables puis désérialisables en JSON.
     ///
     /// Entrées : aucune.
@@ -197,6 +291,21 @@ mod tests {
         let decoded: MessageClientToEngine =
             serde_json::from_str(&encoded).expect("deserialize scan request");
         assert!(matches!(decoded, MessageClientToEngine::ScanLargeFiles));
+
+        let toggle_request = MessageClientToEngine::SetMonitoring {
+            disque: false,
+            reseau: true,
+        };
+        let encoded = serde_json::to_string(&toggle_request).expect("serialize toggle request");
+        let decoded: MessageClientToEngine =
+            serde_json::from_str(&encoded).expect("deserialize toggle request");
+        assert!(matches!(
+            decoded,
+            MessageClientToEngine::SetMonitoring {
+                disque: false,
+                reseau: true
+            }
+        ));
 
         let files_response = MessageEngineToClient::LargeFilesSnapshot {
             files: vec![LargeFileDetails {

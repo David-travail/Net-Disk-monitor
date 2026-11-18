@@ -16,6 +16,8 @@
 .env
 .env.*
 !.env.example
+# Configuration locale (contient le jeton Telegram) ; voir config.example.toml
+config.toml
 
 # =========================
 # VS Code

@@ -19,13 +19,13 @@ L'application repose sur le modèle **Client / Serveur (Moteur + IHM)** :
 ### A. Scrutation de l'Occupation Disque (`disk_monitor`)
 * **Surveillance continue :** Évalue l'espace libre et utilisé des partitions système à intervalle paramétrable.
 * **Alertes Telegram :** Émet une alerte automatique via l'API Telegram Bot dès que l'occupation dépasse un seuil paramétrable (ex: 85% ou 90%).
-* **Suppression ciblée de fichiers :** Offre à l'utilisateur (via l'IHM) la possibilité d'analyser les disques, puis de sélectionner et supprimer un ou plusieurs fichiers volumineux directement depuis l'application. Seuls les fichiers réguliers issus de la dernière analyse peuvent être supprimés (pas de dossiers).
+* **Suppression ciblée de fichiers :** Offre à l'utilisateur (via l'IHM) la possibilité d'analyser les disques, puis de sélectionner et supprimer un ou plusieurs fichiers volumineux directement depuis l'application. L'utilisateur choisit le ou les disques à analyser ; un disque est parcouru sans descendre dans les autres disques montés à l'intérieur. Seuls les fichiers réguliers issus de la dernière analyse peuvent être supprimés (pas de dossiers).
 
 ### B. Scrutation du Réseau Local (`network_monitor`)
 * **Détection d'appareils :** Scanne périodiquement le réseau local (intervalle paramétrable) à la recherche de nouvelles machines ou adresses IP/MAC connectées. Seules les interfaces physiques sont balayées (VPN et interfaces virtuelles exclus). Sous macOS, les entrées ARP expirées sont écartées (`arp -anx`). Un appareil est déclaré déconnecté après `scans_manques_avant_deconnexion` scans sans réponse.
 * **Noms des appareils :** découverte automatique par mDNS unicast puis DNS inverse ; noms personnalisés saisis dans l'IHM (message `SetDeviceAlias`), associés à l'adresse MAC et enregistrés par le moteur dans `noms_appareils.toml`.
 * **Mouvements dans l'IHM :** L'état de chaque appareil (connecté / ne répond plus) et les dernières connexions/déconnexions sont transmis dans `StatusSnapshot`.
-* **Alertes & Journalisation :** Journalise les présences, connexions et déconnexions (console et `network_events.log`). Un appareil jamais vu depuis le démarrage du moteur déclenche une alerte Telegram (réglage `alerte_nouvel_appareil_telegram`).
+* **Alertes & Journalisation :** Journalise les présences, connexions et déconnexions (console et `network_events.log`, archivé chaque jour en `network_events_AAAA-MM-JJ.log` et conservé `duree_conservation_journaux_jours` jours). Un appareil jamais vu depuis le démarrage du moteur déclenche une alerte Telegram (réglage `alerte_nouvel_appareil_telegram`).
 
 ### C. Gestion Dynamique des Tâches & Configuration
 * **Tâches modulaires :** Le moteur est lancé avec les deux tâches activées par défaut.
@@ -115,7 +115,7 @@ pub struct Config {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MessageClientToEngine {
     GetStatus,
-    ScanLargeFiles,
+    ScanLargeFiles { disques: Vec<String> }, // points de montage ; vide = tous
     DeleteFiles { paths: Vec<String> },
     UpdateConfig(Config),
     SetMonitoring { disque: bool, reseau: bool },

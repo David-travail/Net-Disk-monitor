@@ -11,13 +11,14 @@
 //! - `NetDiskMonitorApp::show_*` : dessinent chaque bloc (disques, fichiers, appareils, mouvements).
 //! - `NetDiskMonitorApp::update` : dessine et actualise la fenêtre.
 //! - `main` : démarre la collecte réseau et ouvre la fenêtre graphique.
+//! - `notify_ui_lifecycle` : signale sur Telegram le lancement ou l'arrêt de l'IHM.
 //! - `start_status_polling` : exécute les demandes d'état périodiques en arrière-plan.
 //! - `request_engine` : transmet une requête au moteur via TCP.
 //! - `format_bytes` : convertit une taille en unité lisible.
 //! - `formats_disk_sizes_in_human_readable_units` : teste le formatage des tailles.
 
 use common::{
-    Config, DeviceDetails, DiskDetails, LargeFileDetails, MessageClientToEngine,
+    telegram, Config, DeviceDetails, DiskDetails, LargeFileDetails, MessageClientToEngine,
     MessageEngineToClient, NetworkEventDetails, NetworkEventKind, MAX_ALIAS_CHARS,
 };
 use eframe::egui;
@@ -52,6 +53,10 @@ struct MonitorData {
     was_over_threshold: bool,
     threshold_percent: f32,
     confirm_deletion: bool,
+    /// Disques décochés par l'utilisateur : les autres (y compris les nouveaux) sont analysés.
+    scan_excluded_disks: HashSet<String>,
+    /// Disques de la dernière analyse, réutilisés pour l'actualiser après une suppression.
+    last_scan_disks: Vec<String>,
     /// État des surveillances rapporté par le moteur (`None` tant qu'il n'a pas répondu).
     monitoring: Option<(bool, bool)>,
 }
@@ -125,28 +130,29 @@ impl NetDiskMonitorApp {
                     self.data.devices = connected_devices;
                     self.data.last_error = None;
                     self.data.threshold_percent = seuil_alerte_disque_pourcentage;
-                    let over_threshold = self.data.disks.iter().any(|disk| {
-                        disk.total_bytes > 0
-                            && disk.used_bytes as f64 / disk.total_bytes as f64 * 100.0
-                                >= f64::from(seuil_alerte_disque_pourcentage)
-                    });
+                    let full_disks: Vec<String> = self
+                        .data
+                        .disks
+                        .iter()
+                        .filter(|disk| {
+                            disk.total_bytes > 0
+                                && disk.used_bytes as f64 / disk.total_bytes as f64 * 100.0
+                                    >= f64::from(seuil_alerte_disque_pourcentage)
+                        })
+                        .map(|disk| disk.name.clone())
+                        .collect();
+                    let over_threshold = !full_disks.is_empty();
                     if over_threshold && !self.data.was_over_threshold {
                         self.data.was_over_threshold = true;
-                        if !self.data.is_working {
-                            match self.requests.send(MessageClientToEngine::ScanLargeFiles) {
-                                Ok(()) => {
-                                    self.data.is_working = true;
-                                    self.data.status_message = Some((
-                                        true,
-                                        "Seuil atteint : analyse des fichiers volumineux…".into(),
-                                    ));
-                                }
-                                Err(error) => {
-                                    self.data.last_error = Some(format!(
-                                        "Impossible de lancer l'analyse après l'alerte : {error}"
-                                    ));
-                                }
-                            }
+                        // Analyse automatique limitée aux disques qui dépassent le seuil.
+                        if !self.data.is_working && self.start_scan(full_disks.clone()) {
+                            self.data.status_message = Some((
+                                true,
+                                format!(
+                                    "Seuil atteint : analyse des fichiers volumineux de {}…",
+                                    full_disks.join(", ")
+                                ),
+                            ));
                         }
                     } else if !over_threshold {
                         self.data.was_over_threshold = false;
@@ -213,14 +219,49 @@ impl NetDiskMonitorApp {
         self.data.status_message = Some((success, message));
         if refresh_files {
             self.data.selected_paths.clear();
-            match self.requests.send(MessageClientToEngine::ScanLargeFiles) {
-                Ok(()) => self.data.is_working = true,
-                Err(error) => {
-                    self.data.last_error =
-                        Some(format!("Impossible d'actualiser l'analyse : {error}"));
-                }
+            self.start_scan(self.data.last_scan_disks.clone());
+        }
+    }
+
+    /// Demande au moteur d'analyser les disques indiqués (liste vide : tous les disques).
+    ///
+    /// Sortie : `true` si la demande a été transmise ; sinon l'erreur est affichée.
+    fn start_scan(&mut self, disques: Vec<String>) -> bool {
+        self.data.last_scan_disks = disques.clone();
+        match self
+            .requests
+            .send(MessageClientToEngine::ScanLargeFiles { disques })
+        {
+            Ok(()) => {
+                self.data.is_working = true;
+                true
+            }
+            Err(error) => {
+                self.data.last_error = Some(format!(
+                    "Impossible d'envoyer la demande d'analyse : {error}"
+                ));
+                false
             }
         }
+    }
+
+    /// Efface les résultats de l'analyse affichés, sans toucher aux fichiers sur le disque.
+    fn clear_large_files(&mut self) {
+        self.data.large_files.clear();
+        self.data.selected_paths.clear();
+        self.data.has_scanned = false;
+        self.data.confirm_deletion = false;
+        self.data.status_message = None;
+    }
+
+    /// Disques cochés pour l'analyse, dans l'ordre d'affichage.
+    fn selected_scan_disks(&self) -> Vec<String> {
+        self.data
+            .disks
+            .iter()
+            .map(|disk| disk.name.clone())
+            .filter(|name| !self.data.scan_excluded_disks.contains(name))
+            .collect()
     }
 }
 
@@ -438,31 +479,82 @@ impl NetDiskMonitorApp {
 
     /// Bloc « Fichiers volumineux » : analyse, sélection et suppression.
     fn show_large_files(&mut self, ui: &mut egui::Ui) {
+        // Sans liste de disques (surveillance disque désactivée), tous sont analysés.
+        let disks_known = !self.data.disks.is_empty();
+        let selection = self.selected_scan_disks();
+        let can_scan = !self.data.is_working && (!disks_known || !selection.is_empty());
         ui.horizontal_wrapped(|ui| {
             ui.heading("Fichiers volumineux");
-            if ui
-                .add_enabled(
-                    !self.data.is_working,
-                    egui::Button::new("Analyser les disques"),
-                )
-                .clicked()
-            {
+            let label = match (disks_known, selection.len()) {
+                (false, _) => "Analyser tous les disques".to_owned(),
+                (true, 1) => "Analyser le disque choisi".to_owned(),
+                (true, count) => format!("Analyser les {count} disques choisis"),
+            };
+            let button = ui.add_enabled(can_scan, egui::Button::new(label));
+            let button = if disks_known && selection.is_empty() {
+                button.on_disabled_hover_text("Cochez au moins un disque.")
+            } else {
+                button
+            };
+            if button.clicked() {
                 self.data.last_error = None;
                 self.data.status_message = None;
-                match self.requests.send(MessageClientToEngine::ScanLargeFiles) {
-                    Ok(()) => self.data.is_working = true,
-                    Err(error) => {
-                        self.data.last_error = Some(format!(
-                            "Impossible d'envoyer la demande d'analyse : {error}"
-                        ))
-                    }
-                }
+                self.start_scan(selection.clone());
+            }
+            let has_results = self.data.has_scanned || !self.data.large_files.is_empty();
+            if ui
+                .add_enabled(
+                    !self.data.is_working && has_results,
+                    egui::Button::new("Effacer la liste"),
+                )
+                .on_hover_text("Masquer les résultats de l'analyse (aucun fichier n'est supprimé)")
+                .clicked()
+            {
+                self.clear_large_files();
             }
             if self.data.is_working {
                 ui.spinner();
                 ui.label("Opération en cours…");
             }
         });
+
+        if disks_known {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Disques :");
+                let names: Vec<String> = self.data.disks.iter().map(|d| d.name.clone()).collect();
+                for name in &names {
+                    let mut checked = !self.data.scan_excluded_disks.contains(name);
+                    if ui
+                        .add_enabled(
+                            !self.data.is_working,
+                            egui::Checkbox::new(&mut checked, name.as_str()),
+                        )
+                        .changed()
+                    {
+                        if checked {
+                            self.data.scan_excluded_disks.remove(name);
+                        } else {
+                            self.data.scan_excluded_disks.insert(name.clone());
+                        }
+                    }
+                }
+                if names.len() > 1 {
+                    ui.separator();
+                    if ui
+                        .add_enabled(!self.data.is_working, egui::Button::new("Tous").small())
+                        .clicked()
+                    {
+                        self.data.scan_excluded_disks.clear();
+                    }
+                    if ui
+                        .add_enabled(!self.data.is_working, egui::Button::new("Aucun").small())
+                        .clicked()
+                    {
+                        self.data.scan_excluded_disks.extend(names.iter().cloned());
+                    }
+                }
+            });
+        }
         ui.label(format!(
             "Fichiers d'au moins {} Mio ; les {} plus volumineux sont affichés.",
             self.minimum_file_size_mio, self.maximum_files
@@ -547,8 +639,14 @@ impl NetDiskMonitorApp {
     fn show_devices(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.heading("Appareils du réseau local");
+            let others = self
+                .data
+                .devices
+                .iter()
+                .filter(|d| !d.cette_machine)
+                .count();
             if !self.data.devices.is_empty() {
-                ui.label(format!("{} appareil(s)", self.data.devices.len()));
+                ui.label(format!("{others} autre(s) appareil(s)"));
             }
         });
         if matches!(self.data.monitoring, Some((_, false))) {
@@ -598,8 +696,15 @@ impl NetDiskMonitorApp {
                         cell(ui, egui::RichText::new(&device.ip));
                     });
                     row.col(|ui| {
-                        let response = cell(ui, egui::RichText::new(&device.mac));
-                        if device.has_private_mac() {
+                        let mac = if device.mac.is_empty() {
+                            "—"
+                        } else {
+                            &device.mac
+                        };
+                        let response = cell(ui, egui::RichText::new(mac));
+                        if device.mac.is_empty() {
+                            response.on_hover_text("Adresse MAC non communiquée par le système.");
+                        } else if device.has_private_mac() {
                             response.on_hover_text(
                                 "Adresse MAC privée (aléatoire) : l'appareil peut en changer.",
                             );
@@ -616,12 +721,19 @@ impl NetDiskMonitorApp {
                         let detected = device.hostname.as_deref().unwrap_or("aucun");
                         let response = response
                             .on_hover_text(format!("Nom détecté sur le réseau : {detected}"));
-                        if response.double_clicked() {
+                        if response.double_clicked() && !device.mac.is_empty() {
                             edit_request = Some(device.clone());
                         }
                     });
                     row.col(|ui| {
-                        if responding {
+                        if device.cette_machine {
+                            ui.label(
+                                egui::RichText::new("cette machine")
+                                    .color(colors::ok(ui))
+                                    .strong(),
+                            )
+                            .on_hover_text("Machine sur laquelle tourne le moteur NetDiskMonitor.");
+                        } else if responding {
                             ui.colored_label(colors::ok(ui), "connecté");
                         } else {
                             ui.colored_label(
@@ -631,11 +743,12 @@ impl NetDiskMonitorApp {
                         }
                     });
                     row.col(|ui| {
-                        if ui
-                            .small_button("✏")
+                        // Le nom personnalisé est associé à la MAC : impossible sans elle.
+                        let button = ui
+                            .add_enabled(!device.mac.is_empty(), egui::Button::new("✏").small())
                             .on_hover_text("Donner un nom à cet appareil")
-                            .clicked()
-                        {
+                            .on_disabled_hover_text("Adresse MAC inconnue : nom impossible.");
+                        if button.clicked() {
                             edit_request = Some(device.clone());
                         }
                     });
@@ -915,6 +1028,11 @@ fn main() -> Result<(), eframe::Error> {
         Ok(config) => (config, None),
         Err(error) => (Config::default(), Some(error)),
     };
+    let lifecycle_config = config.clone();
+    let startup_notification = {
+        let config = config.clone();
+        std::thread::spawn(move || notify_ui_lifecycle(&config, "lancée"))
+    };
     let (requests_tx, requests_rx) = tokio_mpsc::unbounded_channel();
     start_status_polling(
         updates_tx,
@@ -933,7 +1051,7 @@ fn main() -> Result<(), eframe::Error> {
         ..Default::default()
     };
 
-    eframe::run_native(
+    let result = eframe::run_native(
         "NetDiskMonitor",
         options,
         Box::new(move |_creation_context| {
@@ -944,7 +1062,41 @@ fn main() -> Result<(), eframe::Error> {
                 configuration_error,
             )))
         }),
-    )
+    );
+
+    // Garantit l'ordre des messages : le lancement est envoyé (ou abandonné) avant l'arrêt.
+    let _ = startup_notification.join();
+    notify_ui_lifecycle(&lifecycle_config, "arrêtée");
+    result
+}
+
+/// Signale sur Telegram le lancement ou l'arrêt de l'IHM, si cette alerte est activée.
+///
+/// Entrées : `config`, identifiants Telegram et options ; `what`, état de l'IHM.
+/// Sortie : aucune ; bloque au plus `delai_http_telegram_secondes`, un échec est
+/// signalé sur la sortie d'erreur.
+fn notify_ui_lifecycle(config: &Config, what: &str) {
+    if !config.alerte_demarrage_arret_telegram || !telegram::is_configured(config) {
+        return;
+    }
+    let text = format!(
+        "NetDiskMonitor : IHM {what} (moteur : {}).",
+        config.adresse_moteur
+    );
+    let result = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| error.to_string())
+        .and_then(|runtime| {
+            runtime.block_on(async {
+                telegram::send_message(&reqwest::Client::new(), config, text)
+                    .await
+                    .map_err(|error| error.to_string())
+            })
+        });
+    if let Err(error) = result {
+        eprintln!("[Telegram] Échec du message de lancement/arrêt de l'IHM : {error}");
+    }
 }
 
 /// Lance un thread qui interroge régulièrement le moteur et transmet les réponses à l'interface.
@@ -1000,7 +1152,8 @@ async fn request_engine(
 ) -> Result<MessageEngineToClient, String> {
     // L'analyse des disques et la suppression peuvent être longues : pas de délai de réponse.
     let response_timeout = match request {
-        MessageClientToEngine::ScanLargeFiles | MessageClientToEngine::DeleteFiles { .. } => None,
+        MessageClientToEngine::ScanLargeFiles { .. }
+        | MessageClientToEngine::DeleteFiles { .. } => None,
         _ => Some(RESPONSE_TIMEOUT),
     };
     let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(engine_address))
@@ -1105,7 +1258,7 @@ mod tests {
     #[test]
     fn reads_all_ui_settings_from_the_shared_config_file() {
         let config =
-            parse_ui_config(include_str!("../../config.toml")).expect("parse shared config");
+            parse_ui_config(include_str!("../../config.example.toml")).expect("parse shared config");
 
         assert_eq!(config.adresse_moteur, "127.0.0.1:7878");
         assert_eq!(config.intervalle_actualisation_ihm_secondes, 3);

@@ -1,3 +1,6 @@
+# Modele de configuration : copier ce fichier en config.toml puis renseigner
+# les identifiants Telegram. config.toml n'est pas versionne (il contient des secrets).
+
 # Surveillance disque.
 activer_surveillance_disque = true
 intervalle_scrutation_disque_secondes = 60
@@ -13,9 +16,18 @@ activer_surveillance_reseau = true
 intervalle_scrutation_reseau_secondes = 30
 # Alerte Telegram lorsqu'un appareil jamais vu depuis le demarrage du moteur apparait.
 alerte_nouvel_appareil_telegram = true
+# Message Telegram au demarrage et a l'arret du moteur et de l'IHM.
+alerte_demarrage_arret_telegram = true
+# Message Telegram a chaque connexion/deconnexion d'un appareil (apres le premier scan).
+alerte_connexion_deconnexion_telegram = true
 # Nombre de scans consecutifs sans reponse avant de declarer un appareil deconnecte.
 # Delai de detection d'un depart : environ ce nombre x intervalle_scrutation_reseau_secondes.
 scans_manques_avant_deconnexion = 2
+
+# Journal reseau : network_events.log contient les evenements du jour. Au demarrage du
+# moteur et a minuit, il est archive en network_events_AAAA-MM-JJ.log ; les archives
+# plus anciennes que ce nombre de jours sont supprimees.
+duree_conservation_journaux_jours = 10
 
 # Analyse des gros fichiers : taille minimale en Mio et nombre maximal de resultats.
 taille_min_fichier_volumineux_mio = 100

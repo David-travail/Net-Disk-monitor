@@ -9,7 +9,7 @@ Les commandes ci-dessous fonctionnent dans PowerShell, Windows Terminal et les t
 
 ## Régler les paramètres
 
-Le fichier `config.toml` à la racine du projet centralise les paramètres du moteur et de l'IHM :
+Le fichier `config.toml` à la racine du projet (non versionné, car il contient le jeton Telegram : créez-le en copiant `config.example.toml`) centralise les paramètres du moteur et de l'IHM :
 
 ```toml
 # Surveillance disque.
@@ -60,7 +60,7 @@ Le moteur démarre les surveillances activées et écoute à l'adresse définie 
 
 À chaque cycle de surveillance réseau, le moteur balaye les réseaux locaux de la machine (interfaces physiques uniquement : un VPN actif est ignoré), puis lit la table ARP. Sous macOS, les entrées ARP expirées, conservées jusqu'à 20 minutes par le système, sont écartées : un appareil parti n'est plus compté. Un appareil est déclaré déconnecté après `scans_manques_avant_deconnexion` scans sans réponse, soit environ ce nombre multiplié par `intervalle_scrutation_reseau_secondes` (1 minute avec les valeurs par défaut).
 
-Le moteur affiche un message horodaté dans la console à chaque cycle. Les événements de présence, connexion et déconnexion sont également horodatés dans la console et dans `network_events.log`.
+Le moteur affiche un message horodaté dans la console à chaque cycle. Les événements de présence, connexion et déconnexion sont également horodatés dans la console et dans `network_events.log`. Ce fichier ne contient que les événements du jour : au démarrage du moteur et à minuit, le journal d'un jour précédent est archivé en `network_events_AAAA-MM-JJ.log`, et les archives plus anciennes que `duree_conservation_journaux_jours` (10 par défaut) sont supprimées.
 
 Pour arrêter le moteur, faites `Ctrl+C` dans ce terminal.
 
@@ -78,7 +78,9 @@ Pour arrêter le moteur, faites `Ctrl+C` dans ce terminal.
    cargo run -p ui
    ```
 
-Le client ouvre une fenêtre graphique qui affiche l'occupation des disques et les appareils présents dans la table ARP. Le bouton d'analyse recherche les fichiers selon `taille_min_fichier_volumineux_mio` (au maximum `nombre_max_fichiers_volumineux` résultats) sur les disques accessibles ; sélectionnez ensuite les fichiers à supprimer et confirmez l'action. Le nom des appareils est découvert automatiquement : le moteur interroge chaque appareil en mDNS (Bonjour/Avahi : Mac, iPhone, imprimantes, box, Linux…), puis par DNS inverse. Les appareils qui ne répondent à aucune des deux méthodes (certaines caméras, prises connectées…) restent sans nom : cliquez sur ✏ (ou double-cliquez sur le nom) pour leur en donner un. Ce nom personnalisé est associé à l'adresse MAC, enregistré par le moteur dans `noms_appareils.toml` et utilisé dans l'IHM, la console, `network_events.log` et les alertes Telegram. Une adresse MAC « privée » (aléatoire, fréquente sur les téléphones) est signalée au survol : si l'appareil en change, le nom ne le suit pas.
+Le client ouvre une fenêtre graphique qui affiche l'occupation des disques et les appareils présents dans la table ARP. Dans le bloc « Fichiers volumineux », cochez le ou les disques à analyser (boutons « Tous » / « Aucun » pour aller plus vite), puis lancez l'analyse : elle recherche les fichiers selon `taille_min_fichier_volumineux_mio` (au maximum `nombre_max_fichiers_volumineux` résultats). Un disque est analysé sans descendre dans les autres disques montés à l'intérieur (par exemple une clé USB sous `/Volumes`), qui ne sont analysés que s'ils sont cochés. Lorsqu'un disque dépasse le seuil d'alerte, seuls les disques concernés sont analysés automatiquement ; sélectionnez ensuite les fichiers à supprimer et confirmez l'action. Le bouton « Effacer la liste » masque les résultats (sans supprimer aucun fichier) pour repartir de zéro avant une nouvelle analyse. Le nom des appareils est découvert automatiquement : le moteur interroge chaque appareil en mDNS (Bonjour/Avahi : Mac, iPhone, imprimantes, box, Linux…), puis par DNS inverse. Les appareils qui ne répondent à aucune des deux méthodes (certaines caméras, prises connectées…) restent sans nom : cliquez sur ✏ (ou double-cliquez sur le nom) pour leur en donner un. Ce nom personnalisé est associé à l'adresse MAC, enregistré par le moteur dans `noms_appareils.toml` et utilisé dans l'IHM, la console, `network_events.log` et les alertes Telegram. Une adresse MAC « privée » (aléatoire, fréquente sur les téléphones) est signalée au survol : si l'appareil en change, le nom ne le suit pas.
+
+La machine sur laquelle tourne le moteur apparaît en tête de la liste avec l'état « cette machine » ; elle n'est jamais signalée comme connectée ou déconnectée. Sous macOS, sa vraie adresse MAC n'est lisible que dans la table ARP : si elle reste vide (« — »), lancez le moteur avec `sudo`.
 
 La section « Appareils du réseau local » indique pour chaque appareil s'il est connecté ou s'il ne répond plus depuis un ou plusieurs scans ; la section « Mouvements récents » liste les dernières connexions et déconnexions, la plus récente en premier. Les cases « Surveillance disque » et « Surveillance réseau » de l'en-tête activent ou désactivent ces tâches à chaud ; ce choix est perdu au redémarrage du moteur, qui reprend les valeurs de `config.toml`. Les données de statut sont actualisées selon `intervalle_actualisation_ihm_secondes`. Si le moteur ne répond pas, un message d'erreur s'affiche dans la fenêtre et le client continue de réessayer.
 

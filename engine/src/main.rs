@@ -12,28 +12,34 @@
 //! - `load_aliases` / `save_aliases` : lisent et écrivent `noms_appareils.toml`.
 //! - `set_device_alias` : associe un nom personnalisé à une adresse MAC.
 //! - `log_network_event` : écrit un événement dans `network_events.log` et le renvoie.
+//! - `rotate_event_logs` : tâche qui archive le journal au changement de jour et purge les anciens.
+//! - `archive_previous_day_log` : renomme le journal d'un jour passé en `network_events_AAAA-MM-JJ.log`.
+//! - `purge_old_logs` : supprime les journaux archivés trop anciens.
 //! - `run_macos_arp` : exécute `arp` sous macOS.
 //! - `keep_confirmed_macos_entries` : écarte les entrées ARP macOS expirées.
 //! - `lan_ipv4_networks` : liste les réseaux locaux (hors VPN et interfaces virtuelles).
 //! - `subnet_hosts` : calcule les adresses à balayer d'un sous-réseau.
 //! - `read_network_devices` : balaye les réseaux locaux puis lit la table ARP.
+//! - `local_machine_devices` : décrit cette machine (IP, MAC, nom d'hôte).
 //! - `normalize_mac` : normalise une adresse MAC.
 //! - `parse_arp_table` : convertit le texte ARP en appareils.
-//! - `send_telegram_message` : envoie un message au chat Telegram configuré.
-//! - `spawn_new_device_alert` : alerte Telegram à l'arrivée d'un appareil inconnu.
+//! - `spawn_telegram_message` : envoie un message Telegram en arrière-plan.
+//! - `device_alert_text` : rédige l'alerte Telegram d'un mouvement d'appareil.
+//! - `notify_lifecycle` : signale sur Telegram le démarrage ou l'arrêt du moteur.
+//! - `shutdown_signal` : attend Ctrl+C (ou SIGTERM sous Unix).
 //! - `set_monitoring` : active ou désactive les surveillances à chaud.
 //! - `handle_client` : traite une requête JSON et écrit sa réponse.
 //! - `parses_linux_and_windows_arp_entries` : teste l'analyse de lignes ARP.
 
 use common::{
-    Config, DeviceDetails, DiskDetails, LargeFileDetails, MessageClientToEngine,
+    telegram, Config, DeviceDetails, DiskDetails, LargeFileDetails, MessageClientToEngine,
     MessageEngineToClient, NetworkEventDetails, NetworkEventKind, MAX_ALIAS_CHARS,
 };
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     error::Error,
     net::{IpAddr, Ipv4Addr, SocketAddrV4},
-    path::Path,
+    path::{Path, PathBuf},
     time::Duration,
 };
 use sysinfo::Disks;
@@ -47,6 +53,10 @@ use tokio::{
 const CONFIG_PATH: &str = "config.toml";
 /// Fichier des noms personnalisés d'appareils (adresse MAC -> nom).
 const ALIASES_PATH: &str = "noms_appareils.toml";
+/// Journal réseau du jour ; les jours précédents sont archivés en `network_events_AAAA-MM-JJ.log`.
+const EVENT_LOG_FILE: &str = "network_events.log";
+/// Préfixe des journaux réseau archivés.
+const EVENT_LOG_ARCHIVE_PREFIX: &str = "network_events_";
 /// Délai maximal accordé à un client pour envoyer sa requête.
 const CLIENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// Taille maximale d'une requête JSON reçue d'un client.
@@ -97,22 +107,76 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     tokio::spawn(monitor_disks(state.clone()));
     tokio::spawn(monitor_network(state.clone()));
+    tokio::spawn(rotate_event_logs(state.clone()));
 
     let listener = TcpListener::bind(&listen_address).await?;
     println!("Moteur NetDiskMonitor en écoute sur {listen_address}");
+    {
+        let state = state.clone();
+        let text = format!("démarré (écoute sur {listen_address})");
+        tokio::spawn(async move { notify_lifecycle(&state, &text).await });
+    }
 
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
     loop {
-        match listener.accept().await {
-            Ok((stream, _)) => {
-                let state = state.clone();
-                tokio::spawn(async move {
-                    if let Err(error) = handle_client(stream, state).await {
-                        eprintln!("Erreur de communication avec le client : {error}");
-                    }
-                });
-            }
-            Err(error) => eprintln!("Impossible d'accepter une connexion : {error}"),
+        tokio::select! {
+            _ = &mut shutdown => break,
+            accepted = listener.accept() => match accepted {
+                Ok((stream, _)) => {
+                    let state = state.clone();
+                    tokio::spawn(async move {
+                        if let Err(error) = handle_client(stream, state).await {
+                            eprintln!("Erreur de communication avec le client : {error}");
+                        }
+                    });
+                }
+                Err(error) => eprintln!("Impossible d'accepter une connexion : {error}"),
+            },
         }
+    }
+
+    println!("Arrêt du moteur NetDiskMonitor…");
+    notify_lifecycle(&state, "arrêté").await;
+    Ok(())
+}
+
+/// Attend une demande d'arrêt : Ctrl+C, ou SIGTERM sous Unix.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut terminate) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = terminate.recv() => {}
+                }
+            }
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+/// Signale sur Telegram le démarrage ou l'arrêt du moteur, si cette alerte est activée.
+///
+/// Entrées : `state`, état partagé (configuration et client HTTP) ; `what`, fin du message.
+/// Sortie : aucune ; un échec d'envoi est signalé sur la sortie d'erreur.
+async fn notify_lifecycle(state: &EngineState, what: &str) {
+    let config = state.config.borrow().clone();
+    if !config.alerte_demarrage_arret_telegram || !telegram::is_configured(&config) {
+        return;
+    }
+    let host = dns_lookup::get_hostname().unwrap_or_else(|_| "machine inconnue".to_owned());
+    let text = format!("NetDiskMonitor : moteur {what} sur {host}.");
+    if let Err(error) = telegram::send_message(&state.http_client, &config, text).await {
+        eprintln!("[Telegram] Échec du message de démarrage/arrêt : {error}");
     }
 }
 
@@ -301,7 +365,7 @@ async fn monitor_disks(state: std::sync::Arc<EngineState>) {
                     disk.used_bytes as f64 / disk.total_bytes as f64 * 100.0
                 };
                 if percent >= f64::from(config.seuil_alerte_disque_pourcentage) {
-                    if !telegram_configured(&config) {
+                    if !telegram::is_configured(&config) {
                         if unconfigured_alerts.insert(disk.name.clone()) {
                             eprintln!(
                                 "[Telegram] Seuil disque atteint sur {} ({percent:.1} %), mais Telegram n'est pas configuré.",
@@ -359,65 +423,44 @@ async fn send_telegram_alert(
         "Alerte NetDiskMonitor : le disque {} est occupé à {:.1} % (seuil : {:.1} %).",
         disk.name, percent, config.seuil_alerte_disque_pourcentage
     );
-    send_telegram_message(client, config, text).await
+    telegram::send_message(client, config, text).await
 }
 
-/// Indique si les identifiants Telegram sont renseignés.
-fn telegram_configured(config: &Config) -> bool {
-    !config.jeton_bot_telegram.is_empty() && !config.identifiant_chat_telegram.is_empty()
-}
-
-/// Envoie un message texte au chat Telegram configuré, avec le délai HTTP configuré.
-async fn send_telegram_message(
-    client: &reqwest::Client,
-    config: &Config,
-    text: String,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let url = format!(
-        "https://api.telegram.org/bot{}/sendMessage",
-        config.jeton_bot_telegram
-    );
-    tokio::time::timeout(
-        Duration::from_secs(config.delai_http_telegram_secondes),
-        async {
-            client
-                .post(url)
-                .json(&serde_json::json!({
-                    "chat_id": config.identifiant_chat_telegram,
-                    "text": text,
-                }))
-                .send()
-                .await
-                .map_err(|error| error.without_url())?
-                .error_for_status()
-                .map_err(|error| error.without_url())?;
-            Ok::<(), Box<dyn Error + Send + Sync>>(())
-        },
-    )
-    .await
-    .map_err(|_| "Délai d'attente Telegram dépassé")??;
-    Ok(())
-}
-
-/// Recherche les plus gros fichiers des volumes disponibles sans suivre les liens symboliques.
+/// Recherche les plus gros fichiers des disques demandés sans suivre les liens symboliques.
 ///
-/// Un même fichier peut être accessible par plusieurs chemins (sous macOS, `/` et
-/// `/System/Volumes/Data`) : sous Unix, les dossiers et fichiers sont identifiés par leur
-/// couple (périphérique, inode) pour n'être parcourus et listés qu'une fois.
+/// Entrées : `minimum_size_bytes`, taille minimale ; `maximum_files`, nombre de résultats ;
+/// `requested`, points de montage à analyser (vide : tous les disques).
+///
+/// Chaque disque est analysé sans descendre dans les autres disques montés à l'intérieur
+/// (ils ne sont analysés que s'ils sont eux-mêmes choisis). Un même fichier peut être
+/// accessible par plusieurs chemins (sous macOS, `/` et `/System/Volumes/Data`) : sous Unix,
+/// dossiers et fichiers sont identifiés par (périphérique, inode) pour n'être listés qu'une fois.
 fn scan_large_files(
     minimum_size_bytes: u64,
     maximum_files: usize,
+    requested: &[String],
 ) -> Result<Vec<LargeFileDetails>, Box<dyn Error + Send + Sync>> {
     let disks = Disks::new_with_refreshed_list();
+    let mount_points: Vec<PathBuf> = disks
+        .iter()
+        .map(|disk| disk.mount_point().to_path_buf())
+        .collect();
+    let roots = select_scan_roots(&mount_points, requested)?;
+
     let mut scan = LargeFileScan {
         minimum_size_bytes,
+        excluded_directories: mount_points.iter().cloned().collect(),
         ..LargeFileScan::default()
     };
+    if cfg!(target_os = "linux") {
+        // Systèmes de fichiers virtuels : tailles fictives (ex. /proc/kcore).
+        scan.excluded_directories
+            .extend(["/proc", "/sys", "/dev", "/run"].map(PathBuf::from));
+    }
     let mut readable_roots = 0;
 
-    for disk in disks.iter() {
-        let root = disk.mount_point();
-        match std::fs::metadata(root) {
+    for root in roots {
+        match std::fs::metadata(&root) {
             Ok(metadata) if !scan.first_visit(&metadata) => {
                 // Volume déjà parcouru par un autre chemin.
                 readable_roots += 1;
@@ -432,7 +475,7 @@ fn scan_large_files(
                 continue;
             }
         }
-        if scan.visit_directory(root) {
+        if scan.visit_directory(&root) {
             readable_roots += 1;
         } else {
             eprintln!("[Analyse] Impossible de lire le volume {}", root.display());
@@ -451,6 +494,30 @@ fn scan_large_files(
     Ok(files)
 }
 
+/// Détermine les points de montage à analyser.
+///
+/// Sortie : tous les disques si `requested` est vide, sinon les disques demandés ;
+/// erreur si un disque demandé n'existe pas (seuls les disques connus peuvent être analysés).
+fn select_scan_roots(
+    mount_points: &[PathBuf],
+    requested: &[String],
+) -> Result<Vec<PathBuf>, Box<dyn Error + Send + Sync>> {
+    if requested.is_empty() {
+        return Ok(mount_points.to_vec());
+    }
+    let mut roots = Vec::new();
+    for name in requested {
+        let path = PathBuf::from(name);
+        if !mount_points.contains(&path) {
+            return Err(format!("Disque inconnu : {name}").into());
+        }
+        if !roots.contains(&path) {
+            roots.push(path);
+        }
+    }
+    Ok(roots)
+}
+
 /// État d'une analyse des fichiers volumineux.
 #[derive(Default)]
 struct LargeFileScan {
@@ -460,6 +527,8 @@ struct LargeFileScan {
     visited_directories: HashSet<(u64, u64)>,
     /// Fichiers déjà retenus, identifiés par (périphérique, inode).
     seen_files: HashSet<(u64, u64)>,
+    /// Dossiers dans lesquels ne pas descendre : autres disques montés, systèmes virtuels.
+    excluded_directories: HashSet<PathBuf>,
 }
 
 /// Identité physique d'un fichier ou dossier (Unix uniquement).
@@ -533,6 +602,9 @@ impl LargeFileScan {
             };
 
             if file_type.is_dir() {
+                if self.excluded_directories.contains(&entry.path()) {
+                    continue;
+                }
                 if self.first_visit(&metadata) {
                     self.visit_directory(&entry.path());
                 }
@@ -653,7 +725,7 @@ async fn monitor_network(state: std::sync::Arc<EngineState>) {
         let cycle_start = tokio::time::Instant::now();
         if config.activer_surveillance_reseau {
             match read_network_devices().await {
-                Ok(mut found) => {
+                Ok((mut found, local_devices)) => {
                     scan_no += 1;
 
                     // Conserve le nom déjà connu d'un appareil.
@@ -709,12 +781,23 @@ async fn monitor_network(state: std::sync::Arc<EngineState>) {
                                 };
                                 events.push(log_network_event(kind, &device));
                                 let is_new = ever_seen.insert(device.mac.clone());
-                                if is_new
-                                    && !first_scan
-                                    && config.alerte_nouvel_appareil_telegram
-                                    && telegram_configured(&config)
-                                {
-                                    spawn_new_device_alert(&state, &config, &device);
+                                if !first_scan && telegram::is_configured(&config) {
+                                    if is_new && config.alerte_nouvel_appareil_telegram {
+                                        spawn_telegram_message(
+                                            &state,
+                                            &config,
+                                            device_alert_text(
+                                                "nouvel appareil sur le réseau local",
+                                                &device,
+                                            ),
+                                        );
+                                    } else if config.alerte_connexion_deconnexion_telegram {
+                                        spawn_telegram_message(
+                                            &state,
+                                            &config,
+                                            device_alert_text("connexion", &device),
+                                        );
+                                    }
                                 }
                                 tracked.insert(device.mac.clone(), (device, 0));
                             }
@@ -733,6 +816,15 @@ async fn monitor_network(state: std::sync::Arc<EngineState>) {
                     for mac in gone {
                         if let Some((device, _)) = tracked.remove(&mac) {
                             events.push(log_network_event(NetworkEventKind::Deconnexion, &device));
+                            if config.alerte_connexion_deconnexion_telegram
+                                && telegram::is_configured(&config)
+                            {
+                                spawn_telegram_message(
+                                    &state,
+                                    &config,
+                                    device_alert_text("déconnexion", &device),
+                                );
+                            }
                         }
                     }
 
@@ -745,6 +837,8 @@ async fn monitor_network(state: std::sync::Arc<EngineState>) {
                         })
                         .collect();
                     devices.sort_by_key(|device| device.ip.parse::<Ipv4Addr>().ok());
+                    // Cette machine en tête de liste, hors suivi des connexions.
+                    devices.splice(0..0, local_devices);
                     let mut snapshot = state.snapshot.write().await;
                     snapshot.devices = devices;
                     snapshot.events.extend(events);
@@ -772,24 +866,29 @@ async fn monitor_network(state: std::sync::Arc<EngineState>) {
     }
 }
 
-/// Envoie en arrière-plan l'alerte Telegram d'un nouvel appareil, sans bloquer le scan.
-fn spawn_new_device_alert(
-    state: &std::sync::Arc<EngineState>,
-    config: &Config,
-    device: &DeviceDetails,
-) {
-    let client = state.http_client.clone();
-    let config = config.clone();
-    let text = format!(
-        "NetDiskMonitor : nouvel appareil sur le réseau local : {} ({}) {}",
+/// Rédige l'alerte Telegram d'un mouvement d'appareil.
+///
+/// Entrées : `what`, nature du mouvement ; `device`, appareil concerné.
+/// Sortie : texte du message.
+fn device_alert_text(what: &str, device: &DeviceDetails) -> String {
+    format!(
+        "NetDiskMonitor : {what} : {} ({}) {}",
         device.ip,
         device.mac,
         device.display_name().unwrap_or("nom inconnu")
-    );
-    let mac = device.mac.clone();
+    )
+}
+
+/// Envoie un message Telegram en arrière-plan, sans bloquer l'appelant.
+///
+/// Entrées : `state`, état partagé (client HTTP) ; `config`, identifiants ; `text`, message.
+/// Sortie : aucune ; un échec d'envoi est signalé sur la sortie d'erreur.
+fn spawn_telegram_message(state: &std::sync::Arc<EngineState>, config: &Config, text: String) {
+    let client = state.http_client.clone();
+    let config = config.clone();
     tokio::spawn(async move {
-        if let Err(error) = send_telegram_message(&client, &config, text).await {
-            eprintln!("[Telegram] Échec de l'alerte nouvel appareil {mac} : {error}");
+        if let Err(error) = telegram::send_message(&client, &config, text.clone()).await {
+            eprintln!("[Telegram] Échec d'envoi de « {text} » : {error}");
         }
     });
 }
@@ -930,6 +1029,102 @@ fn read_dns_name(packet: &[u8], mut offset: usize) -> Option<(String, usize)> {
     None
 }
 
+/// Archive le journal réseau au démarrage puis à chaque changement de jour, et supprime
+/// les archives plus anciennes que `duree_conservation_journaux_jours`.
+///
+/// Entrées : `state`, état partagé contenant la configuration.
+/// Sortie : aucune ; la tâche vérifie le jour chaque minute (robuste à la mise en veille).
+async fn rotate_event_logs(state: std::sync::Arc<EngineState>) {
+    let log_dir = Path::new(".");
+    let mut last_day = None;
+    loop {
+        let today = chrono::Local::now().date_naive();
+        if last_day != Some(today) {
+            archive_previous_day_log(log_dir, today);
+            let retention = state.config.borrow().duree_conservation_journaux_jours;
+            purge_old_logs(log_dir, today, retention);
+            last_day = Some(today);
+        }
+        sleep(Duration::from_secs(60)).await;
+    }
+}
+
+/// Renomme `network_events.log` en `network_events_AAAA-MM-JJ.log` s'il a été écrit pour la
+/// dernière fois avant `today` ; le contenu est ajouté à l'archive si celle-ci existe déjà.
+///
+/// Entrées : `dir`, dossier des journaux ; `today`, date locale du jour.
+/// Sortie : aucune ; les erreurs sont signalées sur la sortie d'erreur.
+fn archive_previous_day_log(dir: &Path, today: chrono::NaiveDate) {
+    let current = dir.join(EVENT_LOG_FILE);
+    let Ok(modified) = std::fs::metadata(&current).and_then(|metadata| metadata.modified()) else {
+        return;
+    };
+    let day = chrono::DateTime::<chrono::Local>::from(modified).date_naive();
+    if day >= today {
+        return;
+    }
+    let archive = dir.join(format!(
+        "{EVENT_LOG_ARCHIVE_PREFIX}{}.log",
+        day.format("%Y-%m-%d")
+    ));
+    let result = if archive.exists() {
+        std::fs::read(&current).and_then(|contents| {
+            use std::io::Write;
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&archive)?
+                .write_all(&contents)?;
+            std::fs::remove_file(&current)
+        })
+    } else {
+        std::fs::rename(&current, &archive)
+    };
+    match result {
+        Ok(()) => println!("[Journal] Journal réseau archivé : {}", archive.display()),
+        Err(error) => eprintln!("[Journal] Archivage de {EVENT_LOG_FILE} impossible : {error}"),
+    }
+}
+
+/// Supprime les journaux archivés datés de plus de `retention_days` jours avant `today`.
+///
+/// Entrées : `dir`, dossier des journaux ; `today`, date locale ; `retention_days`, durée de conservation.
+/// Sortie : aucune ; les erreurs sont signalées sur la sortie d'erreur.
+fn purge_old_logs(dir: &Path, today: chrono::NaiveDate, retention_days: u32) {
+    let Some(limit) = today.checked_sub_days(chrono::Days::new(u64::from(retention_days))) else {
+        return;
+    };
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            eprintln!("[Journal] Lecture du dossier des journaux impossible : {error}");
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(date) = file_name
+            .to_str()
+            .and_then(|name| name.strip_prefix(EVENT_LOG_ARCHIVE_PREFIX))
+            .and_then(|name| name.strip_suffix(".log"))
+            .and_then(|date| chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").ok())
+        else {
+            continue;
+        };
+        if date < limit {
+            match std::fs::remove_file(entry.path()) {
+                Ok(()) => println!(
+                    "[Journal] Ancien journal supprimé : {}",
+                    entry.path().display()
+                ),
+                Err(error) => eprintln!(
+                    "[Journal] Suppression de {} impossible : {error}",
+                    entry.path().display()
+                ),
+            }
+        }
+    }
+}
+
 /// Ajoute un événement horodaté à `network_events.log` et l'affiche dans la console.
 ///
 /// Entrées : `kind`, nature du mouvement ; `device`, appareil concerné.
@@ -953,10 +1148,12 @@ fn log_network_event(kind: NetworkEventKind, device: &DeviceDetails) -> NetworkE
         device.ip, device.mac
     );
 
+    let log_dir = Path::new(".");
+    archive_previous_day_log(log_dir, chrono::Local::now().date_naive());
     let result = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open("network_events.log")
+        .open(log_dir.join(EVENT_LOG_FILE))
         .and_then(|mut file| {
             writeln!(
                 file,
@@ -1000,8 +1197,8 @@ fn is_virtual_interface(name: &str) -> bool {
 /// Liste les réseaux locaux IPv4 à balayer : interfaces physiques avec adresse de diffusion,
 /// hors boucle locale, lien-local, VPN et interfaces virtuelles.
 ///
-/// Sortie : couples (adresse locale, masque).
-fn lan_ipv4_networks() -> Vec<(Ipv4Addr, Ipv4Addr)> {
+/// Sortie : triplets (nom de l'interface, adresse locale, masque).
+fn lan_ipv4_networks() -> Vec<(String, Ipv4Addr, Ipv4Addr)> {
     let interfaces = match get_if_addrs::get_if_addrs() {
         Ok(interfaces) => interfaces,
         Err(error) => {
@@ -1016,9 +1213,9 @@ fn lan_ipv4_networks() -> Vec<(Ipv4Addr, Ipv4Addr)> {
                 && !addr.ip.is_link_local()
                 && addr.broadcast.is_some()
                 && !is_virtual_interface(&interface.name)
-                && !networks.iter().any(|(ip, _)| *ip == addr.ip)
+                && !networks.iter().any(|(_, ip, _)| *ip == addr.ip)
             {
-                networks.push((addr.ip, addr.netmask));
+                networks.push((interface.name.clone(), addr.ip, addr.netmask));
             }
         }
     }
@@ -1099,19 +1296,21 @@ async fn udp_sweep(hosts: Vec<Ipv4Addr>) {
 /// Balaye le réseau local puis lit les entrées ARP de la plateforme.
 ///
 /// Entrées : aucune.
-/// Sortie : liste d'appareils détectés (hors cette machine) ou erreur de lecture.
-async fn read_network_devices() -> Result<Vec<DeviceDetails>, Box<dyn Error + Send + Sync>> {
+/// Sortie : (appareils détectés hors cette machine, interfaces de cette machine),
+/// ou erreur de lecture.
+async fn read_network_devices(
+) -> Result<(Vec<DeviceDetails>, Vec<DeviceDetails>), Box<dyn Error + Send + Sync>> {
     let mut networks = lan_ipv4_networks();
     if networks.is_empty() {
         let local = default_route_ipv4()
             .await
             .ok_or("Adresse IP locale introuvable")?;
-        networks.push((local, Ipv4Addr::new(255, 255, 255, 0)));
+        networks.push((String::new(), local, Ipv4Addr::new(255, 255, 255, 0)));
     }
-    let local_ips: HashSet<String> = networks.iter().map(|(ip, _)| ip.to_string()).collect();
+    let local_ips: HashSet<String> = networks.iter().map(|(_, ip, _)| ip.to_string()).collect();
     let hosts = networks
         .iter()
-        .flat_map(|(ip, netmask)| subnet_hosts(*ip, *netmask))
+        .flat_map(|(_, ip, netmask)| subnet_hosts(*ip, *netmask))
         .collect::<HashSet<_>>()
         .into_iter()
         .collect();
@@ -1147,8 +1346,57 @@ async fn read_network_devices() -> Result<Vec<DeviceDetails>, Box<dyn Error + Se
     }
 
     let mut devices = parse_arp_table(&arp_table);
+    // La table ARP de macOS contient aussi cette machine (entrée permanente) avec sa vraie MAC.
+    let arp_local_macs: HashMap<String, String> = devices
+        .iter()
+        .filter(|device| local_ips.contains(&device.ip))
+        .map(|device| (device.ip.clone(), device.mac.clone()))
+        .collect();
     devices.retain(|device| !local_ips.contains(&device.ip));
-    Ok(devices)
+    Ok((devices, local_machine_devices(&networks, &arp_local_macs)))
+}
+
+/// Adresse renvoyée par macOS à la place de la vraie MAC d'une interface.
+const HIDDEN_MAC: &str = "02:00:00:00:00:00";
+
+/// Décrit cette machine : une entrée par interface réseau locale balayée.
+///
+/// Entrées : `networks`, interfaces retenues (nom, adresse, masque) ; `arp_macs`, MAC de
+/// cette machine trouvées dans la table ARP (IP -> MAC), prioritaires.
+/// Sortie : appareils marqués `cette_machine`, avec MAC de l'interface et nom d'hôte du système.
+fn local_machine_devices(
+    networks: &[(String, Ipv4Addr, Ipv4Addr)],
+    arp_macs: &HashMap<String, String>,
+) -> Vec<DeviceDetails> {
+    let hostname = dns_lookup::get_hostname().ok().map(|name| {
+        let name = name.trim_end_matches('.');
+        name.strip_suffix(".local").unwrap_or(name).to_owned()
+    });
+    networks
+        .iter()
+        .map(|(interface, ip, _)| {
+            let mac = arp_macs
+                .get(&ip.to_string())
+                .cloned()
+                .or_else(|| {
+                    mac_address::mac_address_by_name(interface)
+                        .ok()
+                        .flatten()
+                        .or_else(|| mac_address::get_mac_address().ok().flatten())
+                        .and_then(|mac| normalize_mac(&mac.to_string()))
+                })
+                // macOS masque la vraie adresse aux programmes non autorisés.
+                .filter(|mac| mac != HIDDEN_MAC)
+                .unwrap_or_default();
+            DeviceDetails {
+                ip: ip.to_string(),
+                mac,
+                hostname: hostname.clone(),
+                cette_machine: true,
+                ..DeviceDetails::default()
+            }
+        })
+        .collect()
 }
 
 /// Exécute `/usr/sbin/arp` avec les options données (macOS) et renvoie sa sortie texte.
@@ -1225,9 +1473,7 @@ fn parse_arp_table(contents: &str) -> Vec<DeviceDetails> {
                 devices.push(DeviceDetails {
                     ip: ip.to_string(),
                     mac,
-                    hostname: None,
-                    scans_manques: 0,
-                    alias: None,
+                    ..DeviceDetails::default()
                 });
             }
         }
@@ -1321,12 +1567,12 @@ async fn handle_client(
                 surveillance_reseau_active: network_enabled,
             }
         }
-        Ok(MessageClientToEngine::ScanLargeFiles) => {
+        Ok(MessageClientToEngine::ScanLargeFiles { disques }) => {
             let config = state.config.borrow().clone();
             let minimum_size_bytes = config.taille_min_fichier_volumineux_mio * 1024 * 1024;
             let maximum_files = config.nombre_max_fichiers_volumineux;
             match tokio::task::spawn_blocking(move || {
-                scan_large_files(minimum_size_bytes, maximum_files)
+                scan_large_files(minimum_size_bytes, maximum_files, &disques)
             })
             .await
             {
@@ -1378,12 +1624,18 @@ async fn handle_client(
     Ok(())
 }
 
+
+
+
+//////.  DEBUT DES FONCTIONS DE TEST 
+
 #[cfg(test)]
 mod tests {
     use super::{
-        build_ptr_query, clean_alias, delete_selected_files, is_virtual_interface,
-        keep_confirmed_macos_entries, normalize_mac, parse_arp_table, parse_ptr_response,
-        set_device_alias, set_monitoring, subnet_hosts, validate_config, EngineState, Snapshot,
+        archive_previous_day_log, build_ptr_query, clean_alias, delete_selected_files,
+        is_virtual_interface, keep_confirmed_macos_entries, normalize_mac, parse_arp_table,
+        parse_ptr_response, purge_old_logs, set_device_alias, set_monitoring, subnet_hosts,
+        validate_config, EngineState, Snapshot,
     };
     use common::{Config, LargeFileDetails, MessageEngineToClient};
     use std::{sync::Arc, time::SystemTime};
@@ -1396,7 +1648,7 @@ mod tests {
     /// Sortie : aucune ; le test échoue si les intervalles ou valeurs par défaut sont incorrects.
     fn config_file_contains_all_settings_and_validates() {
         let config: Config =
-            toml::from_str(include_str!("../../config.toml")).expect("parse config file");
+            toml::from_str(include_str!("../../config.example.toml")).expect("parse config file");
 
         assert_eq!(config.intervalle_scrutation_disque_secondes, 60);
         assert_eq!(config.intervalle_scrutation_reseau_secondes, 30);
@@ -1441,6 +1693,67 @@ mod tests {
             ..Config::default()
         };
         assert!(validate_config(&config).is_err());
+    }
+
+    #[test]
+    /// Vérifie l'archivage du journal de la veille et la purge des archives trop anciennes.
+    fn rotates_and_purges_event_logs() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "net-disk-monitor-logs-test-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&directory).expect("create test directory");
+        let today = chrono::Local::now().date_naive();
+
+        // Journal du jour : laissé en place.
+        let current = directory.join("network_events.log");
+        std::fs::write(&current, "aujourd'hui\n").expect("write current log");
+        archive_previous_day_log(&directory, today);
+        assert!(current.exists());
+
+        // Journal écrit la veille : archivé sous la date de la veille.
+        let yesterday_time = SystemTime::now() - std::time::Duration::from_secs(86_400);
+        std::fs::File::options()
+            .write(true)
+            .open(&current)
+            .and_then(|file| file.set_modified(yesterday_time))
+            .expect("set modification time");
+        archive_previous_day_log(&directory, today);
+        let archive = directory.join(format!(
+            "network_events_{}.log",
+            chrono::DateTime::<chrono::Local>::from(yesterday_time)
+                .date_naive()
+                .format("%Y-%m-%d")
+        ));
+        assert!(!current.exists());
+        assert_eq!(
+            std::fs::read_to_string(&archive).expect("read archive"),
+            "aujourd'hui\n"
+        );
+
+        // Purge : 10 jours de conservation.
+        let dated = |days: u64| {
+            directory.join(format!(
+                "network_events_{}.log",
+                (today - chrono::Days::new(days)).format("%Y-%m-%d")
+            ))
+        };
+        for days in [10, 11, 30] {
+            std::fs::write(dated(days), "").expect("write archive");
+        }
+        let unrelated = directory.join("autre_fichier.log");
+        std::fs::write(&unrelated, "").expect("write unrelated");
+        purge_old_logs(&directory, today, 10);
+        assert!(dated(10).exists());
+        assert!(!dated(11).exists());
+        assert!(!dated(30).exists());
+        assert!(unrelated.exists());
+
+        std::fs::remove_dir_all(&directory).expect("remove test directory");
     }
 
     #[tokio::test]
@@ -1696,6 +2009,80 @@ Neighbor                Linklayer Address Expire(O) Expire(I)          Netif Ref
         assert!(!scan.visit_directory(&directory.join("absent")));
         assert_eq!(scan.files.len(), 1);
         std::fs::remove_dir_all(&directory).expect("remove test directory");
+    }
+
+    #[test]
+    /// Vérifie qu'un disque monté dans le disque analysé n'est pas parcouru.
+    fn does_not_descend_into_other_mounted_disks() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "net-disk-monitor-mount-test-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(directory.join("autre_disque")).expect("create directories");
+        std::fs::write(directory.join("a.bin"), vec![0u8; 2048]).expect("create file");
+        std::fs::write(directory.join("autre_disque/b.bin"), vec![0u8; 2048]).expect("create file");
+
+        let mut scan = super::LargeFileScan {
+            minimum_size_bytes: 1024,
+            excluded_directories: [directory.join("autre_disque")].into_iter().collect(),
+            ..Default::default()
+        };
+        assert!(scan.visit_directory(&directory));
+        assert_eq!(scan.files.len(), 1);
+        assert!(scan.files[0].path.ends_with("a.bin"));
+        std::fs::remove_dir_all(&directory).expect("remove test directory");
+    }
+
+    #[test]
+    /// Vérifie la sélection des disques : tous par défaut, refus d'un disque inconnu.
+    fn selects_requested_disks_only() {
+        use std::path::PathBuf;
+        let mounts = vec![PathBuf::from("/"), PathBuf::from("/Volumes/USB")];
+
+        assert_eq!(super::select_scan_roots(&mounts, &[]).unwrap(), mounts);
+        assert_eq!(
+            super::select_scan_roots(
+                &mounts,
+                &["/Volumes/USB".to_owned(), "/Volumes/USB".to_owned()]
+            )
+            .unwrap(),
+            vec![PathBuf::from("/Volumes/USB")]
+        );
+        assert!(super::select_scan_roots(&mounts, &["/etc".to_owned()]).is_err());
+    }
+
+    #[test]
+    /// Vérifie que cette machine est décrite avec la MAC de la table ARP, et que l'adresse
+    /// factice renvoyée par macOS est écartée.
+    fn describes_this_machine() {
+        use std::{collections::HashMap, net::Ipv4Addr};
+        let networks = vec![
+            (
+                "en0".to_owned(),
+                Ipv4Addr::new(192, 168, 1, 171),
+                Ipv4Addr::new(255, 255, 255, 0),
+            ),
+            (
+                "en1".to_owned(),
+                Ipv4Addr::new(10, 0, 0, 2),
+                Ipv4Addr::new(255, 255, 255, 0),
+            ),
+        ];
+        let arp_macs = HashMap::from([
+            ("192.168.1.171".to_owned(), "14:98:77:39:61:7d".to_owned()),
+            ("10.0.0.2".to_owned(), super::HIDDEN_MAC.to_owned()),
+        ]);
+
+        let devices = super::local_machine_devices(&networks, &arp_macs);
+        assert_eq!(devices.len(), 2);
+        assert!(devices.iter().all(|device| device.cette_machine));
+        assert_eq!(devices[0].ip, "192.168.1.171");
+        assert_eq!(devices[0].mac, "14:98:77:39:61:7d");
+        assert_eq!(devices[1].mac, "");
     }
 
     #[test]

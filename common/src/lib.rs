@@ -7,6 +7,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod telegram;
+
 /// Configuration globale du moteur.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -20,7 +22,13 @@ pub struct Config {
     pub activer_surveillance_reseau: bool,
     pub intervalle_scrutation_reseau_secondes: u64,
     pub alerte_nouvel_appareil_telegram: bool,
+    /// Message Telegram au démarrage et à l'arrêt du moteur et de l'IHM.
+    pub alerte_demarrage_arret_telegram: bool,
+    /// Message Telegram à chaque connexion ou déconnexion d'appareil.
+    pub alerte_connexion_deconnexion_telegram: bool,
     pub scans_manques_avant_deconnexion: u8,
+    /// Nombre de jours de conservation des journaux réseau archivés.
+    pub duree_conservation_journaux_jours: u32,
     pub taille_min_fichier_volumineux_mio: u64,
     pub nombre_max_fichiers_volumineux: usize,
     pub adresse_ecoute_moteur: String,
@@ -48,7 +56,10 @@ impl Default for Config {
             activer_surveillance_reseau: true,
             intervalle_scrutation_reseau_secondes: 30,
             alerte_nouvel_appareil_telegram: true,
+            alerte_demarrage_arret_telegram: true,
+            alerte_connexion_deconnexion_telegram: true,
             scans_manques_avant_deconnexion: 2,
+            duree_conservation_journaux_jours: 10,
             taille_min_fichier_volumineux_mio: 100,
             nombre_max_fichiers_volumineux: 100,
             adresse_ecoute_moteur: "127.0.0.1:7878".to_owned(),
@@ -70,9 +81,10 @@ impl Config {
             || self.intervalle_actualisation_ihm_secondes == 0
             || self.delai_http_telegram_secondes == 0
             || self.scans_manques_avant_deconnexion == 0
+            || self.duree_conservation_journaux_jours == 0
         {
             return Err(
-                "Les intervalles, délais et nombres de scans manqués doivent être supérieurs à zéro.",
+                "Les intervalles, délais, nombres de scans manqués et durée de conservation des journaux doivent être supérieurs à zéro.",
             );
         }
         if !self.seuil_alerte_disque_pourcentage.is_finite()
@@ -124,7 +136,11 @@ impl Config {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MessageClientToEngine {
     GetStatus,
-    ScanLargeFiles,
+    /// Recherche les gros fichiers sur les disques indiqués (points de montage) ;
+    /// une liste vide signifie « tous les disques ».
+    ScanLargeFiles {
+        disques: Vec<String>,
+    },
     DeleteFiles {
         paths: Vec<String>,
     },
@@ -172,7 +188,7 @@ pub struct DiskDetails {
     pub used_bytes: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DeviceDetails {
     pub ip: String,
     pub mac: String,
@@ -183,6 +199,9 @@ pub struct DeviceDetails {
     /// Nom personnalisé donné par l'utilisateur, prioritaire sur `hostname`.
     #[serde(default)]
     pub alias: Option<String>,
+    /// Machine sur laquelle tourne le moteur (toujours connectée, jamais journalisée).
+    #[serde(default)]
+    pub cette_machine: bool,
 }
 
 impl DeviceDetails {
@@ -264,6 +283,7 @@ mod tests {
             hostname: Some("Myrtille".to_owned()),
             scans_manques: 0,
             alias: None,
+            cette_machine: false,
         };
         assert_eq!(device.display_name(), Some("Myrtille"));
         assert!(device.has_private_mac());
@@ -286,11 +306,16 @@ mod tests {
             serde_json::from_str(&encoded).expect("deserialize request");
         assert!(matches!(decoded, MessageClientToEngine::GetStatus));
 
-        let scan_request = MessageClientToEngine::ScanLargeFiles;
+        let scan_request = MessageClientToEngine::ScanLargeFiles {
+            disques: vec!["/".to_owned()],
+        };
         let encoded = serde_json::to_string(&scan_request).expect("serialize scan request");
         let decoded: MessageClientToEngine =
             serde_json::from_str(&encoded).expect("deserialize scan request");
-        assert!(matches!(decoded, MessageClientToEngine::ScanLargeFiles));
+        assert!(matches!(
+            decoded,
+            MessageClientToEngine::ScanLargeFiles { disques } if disques == ["/"]
+        ));
 
         let toggle_request = MessageClientToEngine::SetMonitoring {
             disque: false,

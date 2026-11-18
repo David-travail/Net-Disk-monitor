@@ -10,9 +10,10 @@ serde.workspace = true
 serde_json.workspace = true
 sysinfo = "0.30"
 toml.workspace = true
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest.workspace = true
 # Découverte des interfaces réseau IPv4 locales (Windows, Linux, macOS)
 get_if_addrs = "0.5"
 
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 dns-lookup = "4.0.2"
+mac_address = "1"
